@@ -28,7 +28,7 @@ interface AIBlock {
   name: string;
   type: 'coordinator' | 'coder' | 'tester' | 'runner';
   content: string;
-  timestamp: number;
+  timestamp: string;
   iteration: number;
 }
 
@@ -77,7 +77,7 @@ export default function App() {
         name: 'Coordinator Agent',
         type: 'coordinator',
         content: 'Ready to coordinate AI tasks...',
-        timestamp: Date.now() - 5000,
+        timestamp: (Date.now() - 5000).toString(),
         iteration: 1
       },
       {
@@ -85,7 +85,7 @@ export default function App() {
         name: 'Coder Agent (Mistral)',
         type: 'coder',
         content: 'Ready to generate and refine code...',
-        timestamp: Date.now() - 4000,
+        timestamp: (Date.now() - 4000).toString(),
         iteration: 1
       },
       {
@@ -93,7 +93,7 @@ export default function App() {
         name: 'Tester Agent (Phi)',
         type: 'tester',
         content: 'Ready to generate unit tests...',
-        timestamp: Date.now() - 3000,
+        timestamp: (Date.now() - 3000).toString(),
         iteration: 1
       },
       {
@@ -101,7 +101,7 @@ export default function App() {
         name: 'Runner Agent (Llama3.2)',
         type: 'runner',
         content: 'Ready to run tests and report outcomes...',
-        timestamp: Date.now() - 2000,
+        timestamp: (Date.now() - 2000).toString(),
         iteration: 1
       }
     ];
@@ -135,7 +135,7 @@ export default function App() {
       name: 'Coordinator Agent',
       type: 'coordinator',
       content: `Starting new task: "${prompt}"\nAnalyzing requirements and coordinating with agents...`,
-      timestamp: Date.now(),
+      timestamp: Date.now().toString(),
       iteration: interactions.length + 1
     };
     setInteractions(prev => [...prev, coordinatorStart]);
@@ -166,7 +166,7 @@ export default function App() {
         name: 'Coder Agent (Mistral)',
         type: 'coder',
         content: `Generated code for the task:\n\`\`\`python\n${generatedCode}\n\`\`\``,
-        timestamp: Date.now(),
+        timestamp: Date.now().toString(),
         iteration: interactions.length + 1
       };
       setInteractions(prev => [...prev, coderResponse]);
@@ -208,7 +208,7 @@ export default function App() {
         name: 'Tester Agent (Phi)',
         type: 'tester',
         content: `Generated test cases:\n\`\`\`python\n${generatedTests}\n\`\`\``,
-        timestamp: Date.now(),
+        timestamp: Date.now().toString(),
         iteration: interactions.length + 1
       };
       setInteractions(prev => [...prev, testerResponse]);
@@ -250,7 +250,7 @@ export default function App() {
         name: 'Runner Agent (Llama3.2)',
         type: 'runner',
         content: `Test execution results:\n\n${testResults}`,
-        timestamp: Date.now(),
+        timestamp: Date.now().toString(),
         iteration: interactions.length + 1
       };
       setInteractions(prev => [...prev, runnerResponse]);
@@ -263,7 +263,7 @@ export default function App() {
           name: 'Coordinator Agent',
           type: 'coordinator',
           content: 'Some tests have failed. Initiating code revision process...',
-          timestamp: Date.now(),
+          timestamp: Date.now().toString(),
           iteration: interactions.length + 1
         };
         setInteractions(prev => [...prev, coordinatorAnalysis]);
@@ -296,7 +296,7 @@ export default function App() {
           name: 'Coder Agent (Mistral)',
           type: 'coder',
           content: `Code revised based on test failures:\n\`\`\`python\n${refinedCode}\n\`\`\``,
-          timestamp: Date.now(),
+          timestamp: Date.now().toString(),
           iteration: interactions.length + 1
         };
         setInteractions(prev => [...prev, coderRevision]);
@@ -326,7 +326,7 @@ export default function App() {
           name: 'Runner Agent (Llama3.2)',
           type: 'runner',
           content: `Final test execution results after revision:\n\n${refinedTestResults}`,
-          timestamp: Date.now(),
+          timestamp: Date.now().toString(),
           iteration: interactions.length + 1
         };
         setInteractions(prev => [...prev, runnerFinalResponse]);
@@ -363,7 +363,7 @@ export default function App() {
         name: 'Coordinator Agent',
         type: 'coordinator',
         content: `Task completed!\n\nFinal Status:\n- Code: ${programState.generatedCode ? 'Generated' : 'Failed'}\n- Tests: ${programState.generatedTests ? 'Generated' : 'Failed'}\n- Test Results: ${programState.testResults ? 'Available' : 'Failed'}\n\nAll artifacts have been saved and are available for review.`,
-        timestamp: Date.now(),
+        timestamp:Date.now().toString(),
         iteration: interactions.length + 1
       };
       setInteractions(prev => [...prev, coordinatorSummary]);
@@ -376,7 +376,7 @@ export default function App() {
         name: 'Coordinator Agent',
         type: 'coordinator',
         content: `Error occurred: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        timestamp: Date.now(),
+        timestamp: Date.now().toString(),
         iteration: interactions.length + 1
       };
       setInteractions(prev => [...prev, errorInteraction]);

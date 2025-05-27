@@ -146,37 +146,37 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
     
     // Get all messages between these two agents
     const messages = interactions.filter(block => {
-      // For Coordinator-Coder communication
-      if (fromType === 'coordinator' && toType === 'coder') {
+        // For Coordinator-Coder communication
+        if (fromType === 'coordinator' && toType === 'coder') {
         return block.type === 'coordinator' || block.type === 'coder';
-      }
-      
-      // For Coder-Coordinator communication
-      if (fromType === 'coder' && toType === 'coordinator') {
+        }
+        
+        // For Coder-Coordinator communication
+        if (fromType === 'coder' && toType === 'coordinator') {
         return block.type === 'coder' || block.type === 'coordinator';
-      }
-      
-      // For Coordinator-Tester communication
-      if (fromType === 'coordinator' && toType === 'tester') {
+        }
+        
+        // For Coordinator-Tester communication
+        if (fromType === 'coordinator' && toType === 'tester') {
         return block.type === 'coordinator' || block.type === 'tester';
-      }
-      
-      // For Tester-Coordinator communication
-      if (fromType === 'tester' && toType === 'coordinator') {
+        }
+        
+        // For Tester-Coordinator communication
+        if (fromType === 'tester' && toType === 'coordinator') {
         return block.type === 'tester' || block.type === 'coordinator';
-      }
-      
-      // For Coordinator-Runner communication
-      if (fromType === 'coordinator' && toType === 'runner') {
+        }
+        
+        // For Coordinator-Runner communication
+        if (fromType === 'coordinator' && toType === 'runner') {
         return block.type === 'coordinator' || block.type === 'runner';
-      }
-      
-      // For Runner-Coordinator communication
-      if (fromType === 'runner' && toType === 'coordinator') {
+        }
+        
+        // For Runner-Coordinator communication
+        if (fromType === 'runner' && toType === 'coordinator') {
         return block.type === 'runner' || block.type === 'coordinator';
-      }
-      
-      return false;
+        }
+        
+        return false;
     });
 
     // Sort messages by timestamp
@@ -200,16 +200,18 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
         .trim();
 
     // Extract code blocks with language
+    const codeBlocks: string[] = [];
+    let match;
     const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
-    const codeBlocks = [...cleanContent.matchAll(codeBlockRegex)];
+    
+    while ((match = codeBlockRegex.exec(cleanContent)) !== null) {
+        const language = match[1] || 'python';
+        const code = match[2].trim();
+        codeBlocks.push(`Generated ${language} code:\n${code}`);
+    }
     
     if (codeBlocks.length > 0) {
-        // If there are code blocks, return them with proper formatting
-        return codeBlocks.map(block => {
-            const language = block[1] || 'python';
-            const code = block[2].trim();
-            return `Generated ${language} code:\n${code}`;
-        }).join('\n\n');
+        return codeBlocks.join('\n\n');
     }
 
     // For test results
@@ -644,7 +646,7 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
    */
   const AgentBox = ({ id, title, type }: { id: string; title: string; type: AIBlock['type'] }) => (
     <div 
-      className={`absolute rounded-lg border-2 ${isDark ? 'border-gray-600 bg-gray-800' : 'border-gray-300 bg-white'} shadow-lg`}
+      className={`absolute rounded-lg border-2 ${isDark ? 'border-gray-600 bg-gray-800' : 'border-gray-300 bg-white'} shadow-lg flex flex-col`}
       style={{ 
         width: boxSizes[id].width, 
         height: boxSizes[id].height,
@@ -653,12 +655,12 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
       }}
     >
       <div 
-        className={`p-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'} font-semibold select-none cursor-move`}
+        className={`p-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'} font-semibold select-none cursor-move flex-shrink-0`}
         onMouseDown={(e) => startDrag(e, id)}
       >
         {title}
       </div>
-      <div className="p-3 h-[calc(100%-3rem)] overflow-y-auto select-text">
+      <div className="flex-1 overflow-y-auto p-3 select-text">
         {getBlocks(type).map((block, index) => {
           const content = extractContent(block.content);
           if (!content) return null;
@@ -667,7 +669,7 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
             <div key={block.id} className="mb-3">
               <pre className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'} whitespace-pre-wrap font-mono bg-opacity-10 ${
                 isDark ? 'bg-gray-700' : 'bg-gray-100'
-              } p-2 rounded`}>
+              } p-2 rounded overflow-x-auto`}>
                 {content}
               </pre>
               <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'} mt-1`}>

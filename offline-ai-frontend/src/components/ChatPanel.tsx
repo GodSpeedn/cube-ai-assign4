@@ -4,6 +4,7 @@ import { useTheme } from "../hooks/useTheme";
 type Message = {
   role: "user" | "coordinator" | "coder" | "tester" | "runner";
   content: string;
+  file?: string;
 };
 
 export default function ChatPanel() {
@@ -33,52 +34,32 @@ export default function ChatPanel() {
     setInput("");
     setIsLoading(true);
 
-    // 1️⃣ User message
+    // Add user message
     setMessages((prev) => [...prev, { role: "user", content: prompt }]);
 
     try {
-      // 2️⃣ Generate code
-      const codeRes = await fetch("http://localhost:8000/generate-code", {
+      // Send to backend
+      const response = await fetch("http://localhost:8000/process-prompt", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt }),
       });
-      const codeData = await codeRes.json();
-      const code = codeData.code || "⚠️ Failed to generate code.";
-      setMessages((prev) => [...prev, { role: "coder", content: code }]);
-      setMessages((prev) => [...prev, { role: "coordinator", content: codeData.message }]);
-      window.dispatchEvent(new CustomEvent("ai:file-select", { detail: { file: codeData.file, code } }));
-      window.dispatchEvent(new CustomEvent("ai:file-generate", { detail: { file: codeData.file, code } }));
-      setLastCode(code);
+      const data = await response.json();
 
-      // 3️⃣ Generate tests
-      const testRes = await fetch("http://localhost:8000/generate-test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: code }),
-      });
-      const testData = await testRes.json();
-      const tests = testData.code || "⚠️ Failed to generate tests.";
-      setMessages((prev) => [
-        ...prev,
-        { role: "tester", content: `${testData.status}\n\n${testData.result}` },
-      ]);
-      window.dispatchEvent(new CustomEvent("ai:file-generate", { detail: { file: testData.file, code: tests } }));
-      setLastTestCode(tests);
+      // Display all messages from backend
+      if (data.messages) {
+        data.messages.forEach((msg: Message) => {
+          setMessages((prev) => [...prev, msg]);
+          if (msg.role === "coder" || msg.role === "tester") {
+            window.dispatchEvent(new CustomEvent("ai:file-generate", { 
+              detail: { file: msg.file, code: msg.content } 
+            }));
+          }
+        });
+      }
 
-      // 4️⃣ Run tests
-      const runRes = await fetch("http://localhost:8000/run-test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, test_code: tests }),
-      });
-      const runData = await runRes.json();
-      const output = runData.output || "⚠️ No output from run-test.";
-      setMessages((prev) => [...prev, { role: "runner", content: output }]);
-      setLastRunOutput(output);
-
-      // Show refine button if there are failures
-      setShowRefine(output.includes("FAIL"));
+      // Show refine button if needed
+      setShowRefine(data.showRefine || false);
     } catch (err) {
       console.error(err);
       setMessages((prev) => [...prev, { role: "coordinator", content: "❌ Backend error occurred." }]);
@@ -136,16 +117,16 @@ export default function ChatPanel() {
   return (
     <div className={`flex flex-col p-4 ${isDark ? 'bg-gray-800' : 'bg-gray-100'} h-full`}>
       {/* 🗨️ Message list */}
-      <div className="flex-1 overflow-y-auto space-y-2 mb-4 pr-2">
+      <div className="flex-1 overflow-y-auto space-y-2 mb-4 pr-2 max-h-[calc(100vh-200px)]">
         {messages.map((msg, i) => {
           const isUser = msg.role === "user";
           return (
             <div key={i} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
               <div
-                className={`p-3 max-w-[75%] text-sm rounded-lg ${roleColors[msg.role]} text-white whitespace-pre-wrap shadow-md`}
+                className={`p-3 max-w-[75%] text-sm relative rounded-lg border-2 border-gray-700 bg-gray-900/50 text-white whitespace-pre-wrap shadow-md overflow-y-auto`}
               >
                 <div className="font-bold mb-1">{msg.role.toUpperCase()}</div>
-                <div>{msg.content}</div>
+                <div className="max-h-[300px] overflow-y-auto">{msg.content}</div>
               </div>
             </div>
           );
@@ -154,7 +135,7 @@ export default function ChatPanel() {
       </div>
 
       {/* 💬 Input & controls */}
-      <div className="flex gap-2">
+      <div className="flex gap-2 mt-auto">
         <input
           className={`flex-1 p-2 ${isDark ? 'bg-gray-700' : 'bg-white'} ${isDark ? 'text-white' : 'text-gray-900'} rounded border ${isDark ? 'border-gray-600' : 'border-gray-300'} focus:outline-none focus:ring-2 focus:ring-blue-500`}
           value={input}
