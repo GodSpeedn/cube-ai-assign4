@@ -1,6 +1,54 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { useTheme } from '../hooks/useTheme';
 import AIInput from './AIInput';
+import React from 'react';
+import { Agent, AgentConnection } from '../types/ai';
+
+interface AIChatPanelProps {
+  selectedAgent: Agent | null;
+  selectedConnection: AgentConnection | null;
+}
+
+const AIChatPanel: React.FC<AIChatPanelProps> = ({
+  selectedAgent,
+  selectedConnection,
+}) => {
+  // Prefer showing connection messages if a connection is selected
+  const messages = selectedConnection
+    ? selectedConnection.messages || []
+    : selectedAgent
+    ? selectedAgent.messages || []
+    : [];
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 p-4 h-96 overflow-y-auto">
+      <h2 className="text-lg font-semibold mb-2 text-gray-900 dark:text-white">
+        {selectedConnection
+          ? `Conversation: ${selectedConnection.sourceAgent.name} → ${selectedConnection.targetAgent?.name}`
+          : selectedAgent
+          ? `Agent: ${selectedAgent.name}`
+          : 'No selection'}
+      </h2>
+      <div className="space-y-2">
+        {messages.length === 0 ? (
+          <div className="text-gray-400 text-sm">No messages yet.</div>
+        ) : (
+          messages.map((msg, idx) => (
+            <div
+              key={idx}
+              className="bg-gray-100 dark:bg-gray-700 rounded p-2 text-sm"
+            >
+              <span className="font-medium">{msg.sender}: </span>
+              <span>{msg.text}</span>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default AIChatPanel;
 
 interface AIBlock {
   id: string;

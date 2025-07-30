@@ -1,36 +1,48 @@
 import { useEffect, useState } from "react";
+import { getGeneratedFiles, getFileContent } from "../services/api";
 
 export default function FileTree() {
   const [files, setFiles] = useState<string[]>([]);
 
   useEffect(() => {
     // Load saved files when component mounts
-    fetch("http://localhost:8000/list-files")
-      .then(res => res.json())
-      .then(data => setFiles(data.files || []));
+    const loadFiles = async () => {
+      try {
+        const data = await getGeneratedFiles();
+        setFiles(data.files || []);
+      } catch (error) {
+        console.error('Failed to load files:', error);
+      }
+    };
+
+    loadFiles();
 
     // Reload files when a new one is generated
-    const refresh = () => {
-      fetch("http://localhost:8000/list-files")
-        .then(res => res.json())
-        .then(data => setFiles(data.files || []));
+    const refresh = async () => {
+      try {
+        const data = await getGeneratedFiles();
+        setFiles(data.files || []);
+      } catch (error) {
+        console.error('Failed to refresh files:', error);
+      }
     };
 
     window.addEventListener("ai:file-generate", refresh);
     return () => window.removeEventListener("ai:file-generate", refresh);
   }, []);
 
-  const handleClick = (file: string) => {
-    fetch(`http://localhost:8000/generated/${file}`)
-      .then(res => res.text())
-      .then(code => {
-        window.dispatchEvent(new CustomEvent("ai:file-select", {
-          detail: {
-            file: file,
-            code: code
-          }
-        }));
-      });
+  const handleClick = async (file: string) => {
+    try {
+      const code = await getFileContent(file);
+      window.dispatchEvent(new CustomEvent("ai:file-select", {
+        detail: {
+          file: file,
+          code: code
+        }
+      }));
+    } catch (error) {
+      console.error('Failed to load file content:', error);
+    }
   };
 
   return (

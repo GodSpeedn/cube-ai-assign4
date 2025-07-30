@@ -1,75 +1,226 @@
-# AI-Powered Code Generation and Testing System
+# Multi-Agent AI System
 
-This project implements an AI-powered system for code generation, testing, and execution. It uses multiple AI agents (Coordinator, Coder, Tester, and Runner) to handle different aspects of the software development process.
+A sophisticated multi-agent AI system with a modern React frontend and FastAPI backend, featuring code generation, testing, and execution capabilities.
 
-## Features
+## 🚀 Features
 
-- **Code Generation**: Uses Mistral AI to generate Python code based on user requirements
-- **Test Generation**: Uses Phi AI to create comprehensive unit tests
-- **Test Execution**: Uses Llama3.2 to run and analyze test results
-- **Interactive UI**: Real-time visualization of agent interactions
-- **Dark/Light Mode**: Modern UI with theme support
+- **Multi-Agent Architecture**: Coordinator, Coder, Tester, and Runner agents
+- **Modern Frontend**: React + TypeScript with beautiful UI
+- **FastAPI Backend**: Robust API with comprehensive endpoints
+- **Code Generation**: AI-powered Python code generation
+- **Automated Testing**: Test case generation and execution
+- **Visual Workflow Designer**: Drag-and-drop agent workflow creation
+- **GPU Acceleration**: Optimized for CodeLlama and other models
 
-## Project Structure
+## 📁 Project Structure
 
 ```
-.
-├── backend-ai/           # Backend server and AI integration
-│   ├── main.py          # FastAPI server and AI agent logic
-│   └── generated/       # Generated code and test files
-├── offline-ai-frontend/  # React frontend
-│   ├── src/
-│   │   ├── components/  # React components
-│   │   ├── contexts/    # React contexts
-│   │   └── styles/      # CSS styles
-│   └── public/          # Static assets
-└── README.md            # This file
+├── backend-ai/           # FastAPI backend
+│   ├── main.py          # Main backend application
+│   ├── services/        # Backend services
+│   └── generated/       # Generated code and tests
+├── offline-ai-frontend/ # React frontend
+│   ├── src/            # Source code
+│   ├── components/     # React components
+│   └── services/       # Frontend services
+├── setup.py            # Automated setup script
+├── INSTALLATION.md     # Detailed installation guide
+└── README.md           # This file
 ```
 
-## Setup
+## ⚡ Quick Start
 
-1. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### Option 1: Automated Setup (Recommended)
+```bash
+# Run the setup script - it handles everything!
+python setup.py
+```
 
-2. Install Node.js dependencies:
-   ```bash
-   cd offline-ai-frontend
-   npm install
-   ```
+### Option 2: Manual Installation
 
-3. Start the backend server:
+#### What Gets Installed Automatically
+When you run `pip install -r requirements.txt`, these are installed:
+- ✅ **FastAPI** - Web framework
+- ✅ **Uvicorn** - ASGI server  
+- ✅ **Pydantic** - Data validation
+- ✅ **LangChain-Ollama** - Ollama integration
+- ✅ **Python-Multipart** - File uploads
+- ✅ **Requests** - HTTP library
+
+#### What You Need to Install Manually
+❌ **Ollama** (AI model server) - Not a Python package
+❌ **LLM Models** (CodeLlama, Mistral, etc.) - Downloaded separately
+
+```bash
+# 1. Install Python dependencies
+cd backend-ai
+pip install -r requirements.txt
+
+# 2. Install Ollama (system-level application)
+# Windows: winget install Ollama.Ollama
+# macOS: brew install ollama  
+# Linux: curl -fsSL https://ollama.ai/install.sh | sh
+
+# 3. Download AI models
+ollama pull codellama:7b-instruct
+ollama pull mistral
+ollama pull llama2
+
+# 4. Install frontend dependencies
+cd offline-ai-frontend
+npm install
+```
+
+## 🎯 Usage
+
+1. **Start the Backend:**
    ```bash
    cd backend-ai
-   uvicorn main:app --reload
+   python main.py
    ```
 
-4. Start the frontend development server:
+2. **Start the Frontend:**
    ```bash
    cd offline-ai-frontend
-   npm start
+   npm run dev
    ```
 
-## Usage
+3. **Access the Application:**
+   - Backend API: http://localhost:8000
+   - Frontend UI: http://localhost:5173
+   - API Documentation: http://localhost:8000/docs
 
-1. Open your browser to `http://localhost:3000`
-2. Enter your coding requirements in the prompt
-3. Watch as the AI agents work together to:
-   - Generate code
-   - Create tests
-   - Run tests
-   - Refine code if needed
+## 🤖 Available Agents
 
-## Requirements
+- **Coordinator**: Manages workflow and task distribution
+- **Coder**: Generates Python code based on requirements
+- **Tester**: Creates comprehensive test cases
+- **Runner**: Executes tests and reports results
 
-- Python 3.8+
-- Node.js 14+
-- Ollama (for local AI models)
-- FastAPI
-- React
-- TypeScript
+## ⚙️ Configuration
 
-## License
+### GPU Settings
 
-MIT License 
+The system supports GPU acceleration. Configure in `main.py`:
+
+```python
+DEFAULT_GPU_CONFIG = {
+    "num_gpu": 1,
+    "num_thread": 8,
+    "temperature": 0.3,
+    "top_p": 0.9,
+    "repeat_penalty": 1.1,
+    "top_k": 40,
+    "num_ctx": 4096,
+}
+```
+
+### AI Models
+
+Supported models:
+- `codellama:7b-instruct` (recommended for code generation)
+- `mistral` (good for general tasks)
+- `llama2` (balanced performance)
+
+## 📋 System Requirements
+
+### Minimum
+- **Python:** 3.8+
+- **Node.js:** 16+
+- **RAM:** 8GB (16GB recommended)
+- **Storage:** 10GB free space
+- **GPU:** Optional but recommended
+
+### Recommended
+- **Python:** 3.9+
+- **Node.js:** 18+
+- **RAM:** 16GB+
+- **Storage:** 20GB free space
+- **GPU:** NVIDIA GPU with 8GB+ VRAM
+
+## 🔧 API Endpoints
+
+- `POST /chat` - Main chat interface
+- `POST /run-workflow` - Custom agent workflows
+- `POST /run-manual-flow` - Visual workflow execution
+- `GET /health` - Health check
+- `GET /list-files` - List generated files
+- `GET /gpu-status` - GPU configuration status
+
+## 🎨 Frontend Features
+
+- **Chat Interface**: Direct interaction with AI agents
+- **Code Editor**: Syntax-highlighted code editing
+- **File Tree**: Browse generated files
+- **Visual Workflow Designer**: Drag-and-drop agent connections
+- **Test Results**: View test execution results
+- **Dark/Light Theme**: Toggle between themes
+
+## 🔍 Development
+
+### Adding New Agents
+
+1. Create a new agent class inheriting from `BaseAgent`
+2. Implement the required abstract methods
+3. Register the agent type in `AgentFactory`
+4. Update the frontend to support the new agent
+
+### Customizing Models
+
+Modify `MODEL_CONFIGS` in `main.py` to add new model configurations.
+
+## 📝 Troubleshooting
+
+### Common Issues
+
+1. **"ollama command not found"**
+   - Install Ollama: https://ollama.ai
+
+2. **"Model not found" errors**
+   - Download models: `ollama pull codellama:7b-instruct`
+
+3. **Out of memory errors**
+   - Use smaller models or increase RAM
+
+4. **GPU not detected**
+   - Check GPU drivers and Ollama GPU support
+
+### Verification Commands
+
+```bash
+# Check Python dependencies
+pip list | grep -E "(fastapi|uvicorn|langchain)"
+
+# Check Ollama installation
+ollama --version
+
+# Check available models
+ollama list
+
+# Test model loading
+ollama run codellama:7b-instruct "print('Hello, World!')"
+```
+
+## 📚 Documentation
+
+- [Detailed Installation Guide](INSTALLATION.md)
+- [API Documentation](http://localhost:8000/docs) (when server is running)
+- [Model Configuration](backend-ai/main.py#L25-L50)
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
+
+## 📞 Support
+
+For issues and questions:
+1. Check the troubleshooting section above
+2. Review the [Installation Guide](INSTALLATION.md)
+3. Open an issue on GitHub with detailed error information
+
+## 📄 License
+
+This project is open source. Feel free to contribute! 

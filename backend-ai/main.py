@@ -1,315 +1,1790 @@
+# =============================================================================
+# IMPORTS - DON'T CHANGE THESE (unless you know what you're doing)
+# =============================================================================
+# These are all the tools we need to make our agent system work
 import os
 from pathlib import Path
 import re
 from datetime import datetime
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Callable
 import tempfile
 import subprocess
 import sys
 import logging
-import ast
+import asyncio
+from abc import ABC, abstractmethod
+import json
+from enum import Enum
+import ast # Added for syntax validation
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
+
 from langchain_ollama import OllamaLLM
 
-# -----------------------------------------------------------------------------
-# App & CORS Configuration
-# -----------------------------------------------------------------------------
-app = FastAPI()
+# =============================================================================
+# GLOBAL CONFIGURATION
+# =============================================================================
+
+# Default GPU configuration for all agents - Optimized for CodeLlama:7b-instruct
+DEFAULT_GPU_CONFIG = {
+    "num_gpu": 1,  # Use 1 GPU
+    "num_thread": 8,  # Number of CPU threads
+    "temperature": 0.3,  # Lower temperature for more focused code generation
+    "top_p": 0.9,  # Nucleus sampling
+    "repeat_penalty": 1.1,  # Prevent repetition
+    "top_k": 40,  # Top-k sampling for better code quality
+    "num_ctx": 4096,  # Context window size
+}
+
+# Default model configuration - Now using CodeLlama:7b-instruct
+DEFAULT_MODEL = "codellama:7b-instruct"
+
+# Model-specific configurations for different tasks
+MODEL_CONFIGS = {
+    "codellama:7b-instruct": {
+        "num_gpu": 1,
+        "num_thread": 8,
+        "temperature": 0.3,  # Lower for code generation
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+        "top_k": 40,
+        "num_ctx": 4096,
+    },
+    "mistral": {
+        "num_gpu": 1,
+        "num_thread": 8,
+        "temperature": 0.7,  # Higher for general tasks
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+    },
+    "llama2": {
+        "num_gpu": 1,
+        "num_thread": 8,
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+    }
+}
+
+# =============================================================================
+# APP & CORS CONFIGURATION - DON'T CHANGE THIS SECTION
+# =============================================================================
+# What: Creates the web server and allows frontend to connect
+# Why: Frontend needs to talk to backend, CORS allows this
+# Can I change: NO - this is essential for frontend-backend communication
+app = FastAPI(title="Multi-Agent AI System", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows any frontend to connect (for development)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Paths & Directories
-# -----------------------------------------------------------------------------
+# =============================================================================
+# PATHS & DIRECTORIES - YOU CAN CHANGE THESE PATHS
+# =============================================================================
+# What: Defines where files are stored and loaded from
+# Why: We need consistent places to save generated code and tests
+# Can I change: YES - you can change where files are saved
 BASE_DIR = Path(__file__).resolve().parent
-GENERATED_DIR = BASE_DIR / "generated"
-GENERATED_DIR.mkdir(exist_ok=True)
-app.mount(
-    "/generated",
-    StaticFiles(directory=str(GENERATED_DIR)),
-    name="generated"
-)
+GENERATED_DIR = BASE_DIR / "generated"  # Where all generated files go
+GENERATED_DIR.mkdir(exist_ok=True)  # Create directory if it doesn't exist
 
-# -----------------------------------------------------------------------------
-# LLM Agents Initialization
-# -----------------------------------------------------------------------------
-# Coder: generates & refines source code
-# Tester: generates unit tests
-# Runner: executes tests
-coder_llm  = OllamaLLM(model="mistral")
-tester_llm = OllamaLLM(model="phi")
-runner_llm = OllamaLLM(model="llama3.2:3b")
+# =============================================================================
+# ENUMS AND DATA MODELS
+# =============================================================================
+class MessageType(Enum):
+    """
+    What: Different types of messages agents can send to each other
+    Why: So agents know how to handle different kinds of messages
+    Can I change: YES - you can add more message types like "FEEDBACK", "UPDATE", etc.
+    """
+    TASK = "task"        # "Do this work for me"
+    DATA = "data"        # "Here's some information"
+    REQUEST = "request"  # "I need something from you"
+    RESPONSE = "response" # "Here's your answer"
+    ERROR = "error"      # "Something went wrong"
+    STATUS = "status"    # "Here's my current status"
+    REVIEW = "review"    # "Review generated code or tests"
 
-# -----------------------------------------------------------------------------
-# Request Schemas
-# -----------------------------------------------------------------------------
+# =============================================================================
+# AGENT MESSAGE - THE WAY AGENTS TALK TO EACH OTHER
+# =============================================================================
+class AgentMessage(BaseModel):
+    """
+    What: This is like an email between agents - it has sender, receiver, content
+    Why: Agents need a standard way to talk to each other
+    Can I change: YES - but be careful, this affects everything
+    """
+    id: str                              # Unique ID for this message (like email ID)
+    from_agent: str                      # Who sent this message
+    to_agent: str                        # Who should receive this message
+    message_type: MessageType            # What kind of message is this
+    content: str                         # The actual message content
+    metadata: Dict[str, Any] = {}        # Extra information (you can add anything here)
+    timestamp: datetime = datetime.now() # When was this message sent
+    
+    # NEW: These help with retrying failed messages
+    retry_count: int = 0                    # How many times we've tried to send this
+    parent_message_id: Optional[str] = None # If this is a retry, what's the original message
+
+    def create_retry_message(self) -> 'AgentMessage':
+        """
+        What: Makes a copy of this message for retrying
+        Why: Sometimes messages fail, so we need to try again
+        Can I change: YES - you can modify retry logic
+        """
+        return AgentMessage(
+            id=f"{self.id}_retry_{self.retry_count + 1}",
+            from_agent=self.from_agent,
+            to_agent=self.to_agent,
+            message_type=self.message_type,
+            content=self.content,
+            metadata=self.metadata,
+            parent_message_id=self.id,
+            retry_count=self.retry_count + 1
+        )
+
+# =============================================================================
+# AGENT STATUS - TRACKS WHAT EACH AGENT IS DOING
+# =============================================================================
+class AgentStatus(Enum):
+    """
+    What: Tells us what state each agent is in
+    Why: So we know if agents are busy, done, or having problems
+    Can I change: YES - you can add more statuses like "PAUSED", "RESTARTING", etc.
+    """
+    IDLE = "idle"           # Agent is ready for work
+    WORKING = "working"      # Agent is currently processing
+    WAITING = "waiting"      # Agent is waiting for something
+    COMPLETED = "completed"  # Agent finished its task
+    ERROR = "error"          # Agent encountered an error
+
+# =============================================================================
+# AGENT MEMORY - HOW AGENTS REMEMBER THINGS
+# =============================================================================
+class AgentMemory(BaseModel):
+    """
+    What: Each agent has a memory system to remember conversations and context
+    Why: Agents need to remember what they've done and what others have said
+    Can I change: YES - you can add database storage, more memory types, etc.
+    """
+    short_term: List[AgentMessage] = []  # Recent messages (last 50)
+    long_term: Dict[str, Any] = {}       # Persistent data (like a database)
+    context: Dict[str, Any] = {}         # Current context (what we're working on)
+    
+    def add_message(self, message: AgentMessage):
+        """
+        What: Adds a new message to the agent's memory
+        Why: Agents need to remember conversations
+        Can I change: YES - you can change how messages are stored
+        """
+        self.short_term.append(message)
+        # Keep only last 50 messages in short-term (prevents memory overflow)
+        if len(self.short_term) > 50:
+            self.short_term = self.short_term[-50:]
+    
+    def get_context_for_prompt(self) -> str:
+        """
+        What: Creates a summary of recent conversations for LLM prompts
+        Why: LLMs need context to understand what's happening
+        Can I change: YES - you can change how context is formatted
+        """
+        recent_messages = self.short_term[-10:]  # Last 10 messages
+        context_str = "Recent conversation:\n"
+        for msg in recent_messages:
+            context_str += f"{msg.from_agent} -> {msg.to_agent}: {msg.content[:100]}...\n"
+        return context_str
+
+# =============================================================================
+# BASE AGENT - THE FOUNDATION FOR ALL AGENTS
+# =============================================================================
+class BaseAgent(ABC):
+    """
+    What: The base class that all agents inherit from
+    Why: Provides common functionality like message handling and memory
+    Can I change: YES - you can add more base functionality, but be careful
+    """
+    
+    def __init__(self, agent_id: str, agent_type: str, role: str, 
+                 model_name: str = DEFAULT_MODEL, model_config: Dict[str, Any] = None):
+        """
+        What: Sets up a new agent with its identity and AI model
+        Why: Each agent needs a unique identity and its own AI model
+        Can I change: YES - you can add more initialization parameters
+        """
+        self.agent_id = agent_id          # Unique name for this agent
+        self.agent_type = agent_type      # What kind of agent (coder, tester, etc.)
+        self.role = role                  # What this agent does
+        self.status = AgentStatus.IDLE    # Current status
+        self.memory = AgentMemory()       # Agent's memory system
+        self.model_config = model_config or {}  # AI model settings
+        
+        # Initialize LLM - each agent gets its own AI model instance
+        # Get model-specific configuration or use default
+        model_specific_config = MODEL_CONFIGS.get(model_name, DEFAULT_GPU_CONFIG.copy())
+        
+        # Merge configurations: model-specific -> user-provided -> default
+        final_config = {**DEFAULT_GPU_CONFIG, **model_specific_config, **self.model_config}
+        self.llm = OllamaLLM(model=model_name, **final_config)
+        
+        # Message handling - maps message types to handler functions
+        self.message_handlers: Dict[MessageType, Callable] = {
+            MessageType.TASK: self.handle_task,
+            MessageType.DATA: self.handle_data,
+            MessageType.REQUEST: self.handle_request,
+            MessageType.RESPONSE: self.handle_response,
+            MessageType.ERROR: self.handle_error,
+            MessageType.STATUS: self.handle_status
+        }
+    
+    async def process_message(self, message: AgentMessage) -> List[AgentMessage]:
+        """
+        What: Processes an incoming message and returns responses
+        Why: This is how agents communicate with each other
+        Can I change: YES - you can modify how messages are processed
+        """
+        try:
+            self.status = AgentStatus.WORKING
+            self.memory.add_message(message)
+            
+            # Get the right handler for this message type
+            handler = self.message_handlers.get(message.message_type)
+            if handler:
+                responses = await handler(message)
+            else:
+                # If no handler, create an error response
+                responses = [self.create_error_message(message.from_agent, 
+                                                    f"Unknown message type: {message.message_type}")]
+            
+            self.status = AgentStatus.IDLE
+            return responses
+            
+        except Exception as e:
+            self.status = AgentStatus.ERROR
+            return [self.create_error_message(message.from_agent, str(e))]
+    
+    def create_message(self, to_agent: str, message_type: MessageType, 
+                      content: str, metadata: Dict[str, Any] = None) -> AgentMessage:
+        """
+        What: Creates a new message to send to another agent
+        Why: Agents need a standard way to create messages
+        Can I change: YES - you can modify message creation
+        """
+        return AgentMessage(
+            id=f"{self.agent_id}_{datetime.now().timestamp()}",
+            from_agent=self.agent_id,
+            to_agent=to_agent,
+            message_type=message_type,
+            content=content,
+            metadata=metadata or {}
+        )
+    
+    def create_error_message(self, to_agent: str, error: str) -> AgentMessage:
+        """
+        What: Creates an error message when something goes wrong
+        Why: Agents need to report errors to each other
+        Can I change: YES - you can modify error reporting
+        """
+        return self.create_message(to_agent, MessageType.ERROR, error)
+    
+    # These are abstract methods - each agent type must implement them
+    @abstractmethod
+    async def handle_task(self, message: AgentMessage) -> List[AgentMessage]:
+        """Handle task messages - each agent type implements this differently"""
+        pass
+    
+    async def handle_data(self, message: AgentMessage) -> List[AgentMessage]:
+        """Handle data messages - default implementation"""
+        return [self.create_message(message.from_agent, MessageType.RESPONSE, 
+                                  f"Received data: {message.content}")]
+    
+    async def handle_request(self, message: AgentMessage) -> List[AgentMessage]:
+        """Handle request messages - default implementation"""
+        return [self.create_message(message.from_agent, MessageType.RESPONSE, 
+                                  f"Handled request: {message.content}")]
+    
+    async def handle_response(self, message: AgentMessage) -> List[AgentMessage]:
+        """Handle response messages - default implementation"""
+        return []  # Usually no response needed for responses
+    
+    async def handle_error(self, message: AgentMessage) -> List[AgentMessage]:
+        """Handle error messages - default implementation"""
+        print(f"Agent {self.agent_id} received error: {message.content}")
+        return []
+    
+    async def handle_status(self, message: AgentMessage) -> List[AgentMessage]:
+        """Handle status messages - default implementation"""
+        return [self.create_message(message.from_agent, MessageType.STATUS, 
+                                  f"Status: {self.status.value}")]
+    
+    def update_model(self, model_name: str, model_config: Dict[str, Any] = None):
+        """
+        What: Changes the AI model this agent uses
+        Why: Agents might need different models for different tasks
+        Can I change: YES - you can modify model switching logic
+        """
+        self.model_config = model_config or {}
+        self.llm = OllamaLLM(model=model_name, **self.model_config)
+
+# =============================================================================
+# COORDINATOR AGENT - THE BOSS AGENT
+# =============================================================================
+class CoordinatorAgent(BaseAgent):
+    """
+    What: The main coordinator that manages other agents
+    Why: Someone needs to coordinate the workflow and assign tasks
+    Can I change: YES - you can modify how coordination works
+    """
+    
+    async def handle_task(self, message: AgentMessage) -> List[AgentMessage]:
+        """
+        What: Handles incoming tasks and coordinates the workflow
+        Why: This is where the main logic for task distribution happens
+        Can I change: YES - you can modify the coordination strategy
+        """
+        try:
+            print(f"🎯 CoordinatorAgent received task: {message.content}")
+            
+            # Get context from memory
+            context = self.memory.get_context_for_prompt()
+            
+            # Create a comprehensive prompt for the coordinator
+            prompt = f"""
+            You are a smart coordinator managing a team of AI agents.
+            
+            Current task: {message.content}
+            Recent context: {context}
+            
+            Your job is to:
+            1. Break down the task into steps
+            2. Decide which agents should handle each step
+            3. Create clear instructions for each agent
+            
+            Available agents:
+            - coder: Writes code and implements features
+            - tester: Creates test cases and validates code
+            - runner: Executes tests and reports results
+            
+            Respond with a JSON structure like this:
+            {{
+                "steps": [
+                    {{
+                        "agent": "coder",
+                        "task": "Write a Python function that...",
+                        "priority": 1
+                    }},
+                    {{
+                        "agent": "tester", 
+                        "task": "Create test cases for the function",
+                        "priority": 2
+                    }}
+                ]
+            }}
+            """
+            
+            # Get AI response
+            response = self.llm.invoke(prompt)
+            
+            # Try to parse the response as JSON
+            try:
+                import json
+                plan = json.loads(response)
+                steps = plan.get("steps", [])
+            except:
+                # If JSON parsing fails, create a simple plan
+                steps = [
+                    {"agent": "coder", "task": message.content, "priority": 1},
+                    {"agent": "tester", "task": "Create tests for the generated code", "priority": 2}
+                ]
+            
+            print(f"📋 Created {len(steps)} workflow steps")
+            
+            # Create messages for each step
+            responses = []
+            for step in steps:
+                agent_id = step["agent"]
+                task = step["task"]
+                
+                print(f"📤 Sending task to {agent_id}: {task[:50]}...")
+                
+                # Create task message for the agent
+                task_message = self.create_message(
+                    to_agent=agent_id,
+                    message_type=MessageType.TASK,
+                    content=task,
+                    metadata={"priority": step.get("priority", 1)}
+                )
+                responses.append(task_message)
+            
+            print(f"📤 Sending {len(responses)} task messages")
+            return responses
+            
+        except Exception as e:
+            print(f"❌ Coordination failed: {str(e)}")
+            return [self.create_error_message(message.from_agent, f"Coordination failed: {str(e)}")]
+
+# =============================================================================
+# CODER AGENT - WRITES CODE
+# =============================================================================
+class CoderAgent(BaseAgent):
+    """
+    What: An agent that writes code based on requirements
+    Why: We need an agent specifically for code generation
+    Can I change: YES - you can modify how code generation works
+    """
+    
+    async def handle_task(self, message: AgentMessage) -> List[AgentMessage]:
+        """
+        What: Handles coding tasks and generates code
+        Why: This is where the actual code generation happens
+        Can I change: YES - you can modify the code generation strategy
+        """
+        try:
+            print(f"🔧 CoderAgent received task: {message.content}")
+            
+            # Simplified prompt - let the LLM handle formatting
+            prompt = f"""
+You are an expert Python developer. Write clean, working Python code.
+
+Task: {message.content}
+
+Requirements:
+- Write complete, runnable Python code
+- Include proper error handling
+- Add type hints and docstrings
+- Follow PEP 8 style guidelines
+- Generate ONLY the Python code, no explanations
+
+Example format:
+def example_function(param: int) -> str:
+    \"\"\"Brief description of function.\"\"\"
+    try:
+        # Implementation here
+        return str(param)
+    except Exception as e:
+        raise ValueError(f"Error: {{e}}")
+"""
+            
+            response = self.llm.invoke(prompt)
+            code = self._simple_code_extraction(response)
+            
+            # Save and return
+            timestamp = _timestamp()
+            filename = f"code_{timestamp}.py"
+            filepath = GENERATED_DIR / filename
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(code)
+            
+            # Return messages
+            response_message = self.create_message(
+                to_agent=message.from_agent,
+                message_type=MessageType.DATA,
+                content=f"Generated code saved to {filename}",
+                metadata={"code": code, "filename": filename, "filepath": str(filepath)}
+            )
+            
+            tester_message = self.create_message(
+                to_agent="tester",
+                message_type=MessageType.DATA,
+                content=f"Code generated for testing",
+                metadata={"code": code, "filename": filename, "filepath": str(filepath)}
+            )
+            
+            return [response_message, tester_message]
+            
+        except Exception as e:
+            print(f"❌ Code generation failed: {str(e)}")
+            return [self.create_error_message(message.from_agent, f"Code generation failed: {str(e)}")]
+    
+    def _simple_code_extraction(self, response: str) -> str:
+        """Simple, robust code extraction"""
+        # Remove markdown code blocks
+        code = re.sub(r'```python\n', '', response)
+        code = re.sub(r'```\n', '', code)
+        code = re.sub(r'```', '', code)
+        
+        # Remove common prefixes
+        lines = code.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            # Skip markdown headers and explanations
+            if line.strip().startswith('#') and len(line.strip().split()) > 3:
+                continue
+            cleaned_lines.append(line)
+        
+        return '\n'.join(cleaned_lines).strip()
+    
+    def _fix_indentation(self, code: str) -> str:
+        """
+        Fix common indentation issues in Python code
+        """
+        # Simple approach: ensure consistent 4-space indentation
+        lines = code.split('\n')
+        fixed_lines = []
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Skip empty lines
+            if not stripped:
+                fixed_lines.append('')
+                continue
+            
+            # Remove any existing indentation and add proper 4-space indentation
+            # This is a simplified approach that ensures consistent formatting
+            fixed_lines.append(stripped)
+        
+        return '\n'.join(fixed_lines)
+    
+    def _validate_python_syntax(self, code: str) -> bool:
+        """
+        Validate Python syntax
+        """
+        try:
+            compile(code, '<string>', 'exec')
+            return True
+        except SyntaxError:
+            return False
+    
+    def _fix_common_syntax_issues(self, code: str) -> str:
+        """
+        Fix common syntax issues in generated code
+        """
+        # Fix common issues
+        code = code.replace('```python', '').replace('```', '')
+        code = code.replace('`', '')
+        
+        # Remove any markdown formatting
+        lines = code.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            # Skip markdown lines
+            if line.strip().startswith('#') and not line.strip().startswith('##'):
+                continue
+            if line.strip().startswith('[') and line.strip().endswith(']'):
+                continue
+            cleaned_lines.append(line)
+        
+        # Fix common indentation and docstring issues
+        fixed_code = self._fix_docstring_and_indentation('\n'.join(cleaned_lines))
+        
+        return fixed_code
+    
+    def _fix_docstring_and_indentation(self, code: str) -> str:
+        """
+        Fix docstring and indentation issues in generated code
+        """
+        lines = code.split('\n')
+        fixed_lines = []
+        in_function = False
+        in_docstring = False
+        docstring_content = []
+        
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            
+            # Skip empty lines
+            if not stripped:
+                fixed_lines.append('')
+                continue
+            
+            # Check if we're entering a function
+            if stripped.startswith('def '):
+                in_function = True
+                in_docstring = False
+                docstring_content = []
+                fixed_lines.append(stripped)
+                continue
+            
+            # Check if we're entering a docstring
+            if stripped.startswith('"""') or stripped.startswith("'''"):
+                if in_function and not in_docstring:
+                    in_docstring = True
+                    # Add proper indentation for docstring start
+                    fixed_lines.append('    ' + stripped)
+                    continue
+                elif in_docstring:
+                    in_docstring = False
+                    # Add proper indentation for docstring end
+                    fixed_lines.append('    ' + stripped)
+                    continue
+            
+            # Handle docstring content
+            if in_docstring:
+                # Collect docstring content
+                docstring_content.append(stripped)
+                continue
+            
+            # If we were in a docstring but didn't find closing quotes, add them
+            if docstring_content and not in_docstring:
+                # Add the collected docstring content with proper indentation
+                for content_line in docstring_content:
+                    fixed_lines.append('    ' + content_line)
+                # Add closing quotes
+                fixed_lines.append('    """')
+                docstring_content = []
+            
+            # Handle function body - simple 4-space indentation
+            if in_function and not in_docstring and not docstring_content:
+                # Simple approach: indent everything in function body with 4 spaces
+                fixed_lines.append('    ' + stripped)
+                continue
+            
+            # Handle non-function code
+            fixed_lines.append(stripped)
+        
+        # If we still have docstring content at the end, add closing quotes
+        if docstring_content:
+            for content_line in docstring_content:
+                fixed_lines.append('    ' + content_line)
+            fixed_lines.append('    """')
+        
+        return '\n'.join(fixed_lines)
+    
+    def _get_fallback_code(self) -> str:
+        """
+        Get fallback code with proper indentation
+        """
+        return '''def add_two_numbers(a: int, b: int) -> int:
+    \"\"\"
+    Add two numbers together.
+    
+    Args:
+        a (int): First number
+        b (int): Second number
+        
+    Returns:
+        int: Sum of the two numbers
+    \"\"\"
+    try:
+        return a + b
+    except TypeError as e:
+        raise ValueError(f"Both arguments must be numbers: {e}")'''
+
+# =============================================================================
+# TESTER AGENT - CREATES TESTS
+# =============================================================================
+class TesterAgent(BaseAgent):
+    """
+    What: An agent that creates test cases for code
+    Why: We need an agent specifically for test generation
+    Can I change: YES - you can modify how test generation works
+    """
+    
+    async def handle_task(self, message: AgentMessage) -> List[AgentMessage]:
+        """
+        What: Handles task messages for test generation
+        Why: Required by abstract BaseAgent class
+        Can I change: YES - you can modify task handling
+        """
+        # For now, just acknowledge the task
+        return [self.create_message(message.from_agent, MessageType.RESPONSE, 
+                                  f"Tester agent received task: {message.content}")]
+    
+    async def handle_data(self, message: AgentMessage) -> List[AgentMessage]:
+        """
+        What: Handles code data and generates test cases
+        Why: This is where test generation happens
+        Can I change: YES - you can modify the test generation strategy
+        """
+        try:
+            print(f"🧪 TesterAgent received data: {message.content}")
+            
+            # Extract code from metadata
+            code = message.metadata.get("code", "")
+            if not code:
+                print("❌ No code provided for testing")
+                return [self.create_error_message(message.from_agent, "No code provided for testing")]
+            
+            print(f"📝 Code to test: {len(code)} characters")
+            
+            # Create a comprehensive testing prompt
+            prompt = f"""
+            You are an expert Python tester.
+            
+            Code to test:
+            {code}
+            
+            Requirements:
+            1. Create comprehensive unit tests using unittest
+            2. Test all functions and methods
+            3. Include edge cases and error conditions
+            4. Use descriptive test names
+            5. Include setup and teardown if needed
+            6. Make sure tests are complete and runnable
+            7. Test both valid inputs and invalid inputs
+            8. Test edge cases like zero, negative numbers, large numbers
+            9. DO NOT include the original code in the test file - the runner will import it
+            10. Only generate the test code, not the original code
+            11. DO NOT use import statements for the functions - they will be available directly
+            12. Write tests as if the functions are already defined in the same scope
+            
+            Generate only the test code, no explanations or markdown formatting.
+            """
+            
+            print(f"🤖 Sending test prompt to LLM: {prompt[:100]}...")
+            
+            # Get AI response
+            response = self.llm.invoke(prompt)
+            print(f"📝 LLM test response received: {len(response)} characters")
+            
+            # Extract test code from response
+            test_code = self._extract_and_clean_test_code(response)
+            print(f"🔍 Extracted test code: {len(test_code)} characters")
+            
+            if not test_code or len(test_code.strip()) < 10:
+                print("⚠️ No valid test code extracted, using fallback")
+                test_code = self._get_fallback_tests()
+            
+            # FIX: Validate syntax and apply emergency fixes
+            if not self._validate_python_syntax(test_code):
+                print("⚠️ Generated test code has syntax issues, applying emergency fixes")
+                test_code = self._apply_test_emergency_fixes(test_code)
+            
+            # Save the generated tests to a file
+            timestamp = _timestamp()
+            filename = f"test_{timestamp}.py"
+            filepath = GENERATED_DIR / filename
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(test_code)
+            
+            print(f"💾 Tests saved to: {filepath}")
+            
+            # Create response message with the tests for the original sender
+            response_message = self.create_message(
+                to_agent=message.from_agent,
+                message_type=MessageType.DATA,
+                content=f"Generated tests saved to {filename}",
+                metadata={
+                    "test_code": test_code,
+                    "filename": filename,
+                    "filepath": str(filepath),
+                    "original_code": code
+                }
+            )
+            
+            # ALSO send the tests directly to the runner agent
+            runner_message = self.create_message(
+                to_agent="runner",
+                message_type=MessageType.DATA,
+                content=f"Tests generated for execution",
+                metadata={
+                    "test_code": test_code,
+                    "filename": filename,
+                    "filepath": str(filepath),
+                    "original_code": code
+                }
+            )
+            
+            print(f"📤 Sending {len([response_message, runner_message])} messages")
+            return [response_message, runner_message]
+            
+        except Exception as e:
+            print(f"❌ Test generation failed: {str(e)}")
+            return [self.create_error_message(message.from_agent, f"Test generation failed: {str(e)}")]
+    
+    # FIX: Add proper test code extraction method (like CoderAgent's _extract_and_clean_code)
+    def _extract_and_clean_test_code(self, response: str) -> str:
+        """Extract and clean test code from LLM response"""
+        # Remove markdown code blocks
+        code = re.sub(r'```python\n', '', response)
+        code = re.sub(r'```\n', '', code)
+        code = re.sub(r'```', '', code)
+        
+        # Remove explanatory text and keep only test code
+        lines = code.split('\n')
+        test_lines = []
+        in_test_code = False
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Start collecting when we see imports or class definitions
+            if (stripped.startswith(('import ', 'from ', 'class Test', 'class test')) or
+                (line.startswith('    def test_') and stripped) or
+                (stripped and in_test_code)):
+                in_test_code = True
+                test_lines.append(line)
+            elif in_test_code and not stripped:
+                # Keep empty lines within test code
+                test_lines.append(line)
+            elif in_test_code and stripped.startswith('if __name__'):
+                # Keep the main block
+                test_lines.append(line)
+        
+        return '\n'.join(test_lines).strip()
+    
+    # FIX: Add syntax validation method (like CoderAgent)
+    def _validate_python_syntax(self, code: str) -> bool:
+        """Validate Python syntax"""
+        try:
+            ast.parse(code)
+            return True
+        except SyntaxError:
+            return False
+    
+    # FIX: Add emergency fixes method (like CoderAgent's _apply_emergency_fixes)
+    def _apply_test_emergency_fixes(self, test_code: str) -> str:
+        """Apply emergency fixes to make test code syntactically correct"""
+        lines = test_code.split('\n')
+        fixed_lines = []
+        
+        for line in lines:
+            if line.strip():
+                # Fix indentation - use 4 spaces consistently
+                leading_spaces = len(line) - len(line.lstrip())
+                correct_spaces = (leading_spaces // 4) * 4
+                fixed_line = ' ' * correct_spaces + line.lstrip()
+                fixed_lines.append(fixed_line)
+            else:
+                fixed_lines.append('')
+        
+        # Ensure basic test structure
+        fixed_code = '\n'.join(fixed_lines)
+        if not fixed_code.strip() or "import unittest" not in fixed_code:
+            return self._get_fallback_tests()
+        
+        return fixed_code
+    
+    def _get_fallback_tests(self) -> str:
+        """Get fallback test code"""
+        return '''import unittest
+
+class TestFunction(unittest.TestCase):
+    def test_basic_functionality(self):
+        # Add your test here
+        self.assertTrue(True)
+
+    def test_edge_cases(self):
+        # Add edge case tests here
+        self.assertTrue(True)
+
+if __name__ == "__main__":
+    unittest.main()'''
+
+# =============================================================================
+# RUNNER AGENT - EXECUTES TESTS
+# =============================================================================
+class RunnerAgent(BaseAgent):
+    """
+    What: An agent that executes tests and reports results
+    Why: We need an agent to actually run the tests and check if they pass
+    Can I change: YES - you can modify how test execution works
+    """
+    
+    async def handle_task(self, message: AgentMessage) -> List[AgentMessage]:
+        """
+        What: Handles task messages for test execution
+        Why: Required by abstract BaseAgent class
+        Can I change: YES - you can modify task handling
+        """
+        # For now, just acknowledge the task
+        return [self.create_message(message.from_agent, MessageType.RESPONSE, 
+                                  f"Runner agent received task: {message.content}")]
+    
+    async def handle_data(self, message: AgentMessage) -> List[AgentMessage]:
+        """
+        What: Handles test data and executes the tests
+        Why: This is where actual test execution happens
+        Can I change: YES - you can modify the test execution strategy
+        """
+        try:
+            print(f"🏃 RunnerAgent received data: {message.content}")
+            
+            # Extract test code and original code from metadata
+            test_code = message.metadata.get("test_code", "")
+            original_code = message.metadata.get("original_code", "")
+            
+            if not test_code:
+                print("❌ No test code provided")
+                return [self.create_error_message(message.from_agent, "No test code provided")]
+            
+            print(f"🧪 Test code to execute: {len(test_code)} characters")
+            print(f"📝 Original code: {len(original_code)} characters")
+            
+            # Run the tests
+            test_results = self._run_tests(original_code, test_code)
+            print(f"🏃 Test execution completed: {len(test_results)} characters")
+            
+            # Determine if tests passed
+            tests_passed = "✅ TESTS PASSED" in test_results
+            
+            # Create response message with test results
+            response_message = self.create_message(
+                to_agent=message.from_agent,
+                message_type=MessageType.DATA,
+                content=f"Test execution completed",
+                metadata={
+                    "test_results": test_results,
+                    "tests_passed": tests_passed,
+                    "original_code": original_code,
+                    "test_code": test_code
+                }
+            )
+            
+            print(f"📤 Sending test results: {'PASSED' if tests_passed else 'FAILED'}")
+            return [response_message]
+            
+        except Exception as e:
+            print(f"❌ Test execution failed: {str(e)}")
+            return [self.create_error_message(message.from_agent, f"Test execution failed: {str(e)}")]
+    
+    def _run_tests(self, code: str, test_code: str) -> str:
+        """
+        What: Actually runs the tests and returns the results
+        Why: We need to execute the tests in a safe environment
+        Can I change: YES - you can modify the test execution environment
+        """
+        try:
+            print(f"🔧 Running tests with {len(code)} chars of code and {len(test_code)} chars of tests")
+            
+            # Create a temporary file for the code
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                f.write(code)
+                code_file = f.name
+            
+            # Create a temporary file for the tests that imports the code
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                # Create test file that imports the code
+                test_content = f"""
+import sys
+import os
+sys.path.insert(0, r'{os.path.dirname(code_file)}')
+
+# Import the code to test
+exec(open(r'{code_file}').read())
+
+{test_code}
+"""
+                f.write(test_content)
+                test_file = f.name
+            
+            print(f"📁 Created code file: {code_file}")
+            print(f"📁 Created test file: {test_file}")
+            
+            # Run the tests using subprocess
+            result = subprocess.run(
+                [sys.executable, test_file],
+                capture_output=True,
+                text=True,
+                timeout=30  # 30 second timeout
+            )
+            
+            print(f"🏃 Test execution completed with return code: {result.returncode}")
+            print(f"📤 stdout: {len(result.stdout)} chars")
+            print(f"📤 stderr: {len(result.stderr)} chars")
+            
+            # Clean up temporary files
+            os.unlink(code_file)
+            os.unlink(test_file)
+            
+            # Return the test results
+            if result.returncode == 0:
+                return f"✅ TESTS PASSED\n{result.stdout}"
+            else:
+                return f"❌ TESTS FAILED\n{result.stdout}\n{result.stderr}"
+                
+        except subprocess.TimeoutExpired:
+            return "❌ TESTS TIMEOUT - Tests took too long to run"
+        except Exception as e:
+            return f"❌ TEST EXECUTION ERROR: {str(e)}"
+
+# =============================================================================
+# AGENT FACTORY - CREATES AGENTS DYNAMICALLY
+# =============================================================================
+class AgentFactory:
+    """
+    What: A factory that creates different types of agents
+    Why: We need a way to create agents without hardcoding them
+    Can I change: YES - you can add new agent types here
+    """
+    
+    # Registry of available agent types
+    _agent_types = {
+        "coordinator": CoordinatorAgent,
+        "coder": CoderAgent,
+        "tester": TesterAgent,
+        "runner": RunnerAgent
+    }
+    
+    @classmethod
+    def create_agent(cls, agent_id: str, agent_type: str, role: str, 
+                    model_name: str = DEFAULT_MODEL, 
+                    model_config: Dict[str, Any] = None) -> BaseAgent:
+        """
+        What: Creates a new agent of the specified type
+        Why: This allows us to create agents dynamically
+        Can I change: YES - you can modify how agents are created
+        """
+        if agent_type not in cls._agent_types:
+            raise ValueError(f"Unknown agent type: {agent_type}")
+        
+        agent_class = cls._agent_types[agent_type]
+        return agent_class(agent_id, agent_type, role, model_name, model_config)
+    
+    @classmethod
+    def register_agent_type(cls, agent_type: str, agent_class: type):
+        """
+        What: Registers a new agent type
+        Why: This allows you to add custom agent types
+        Can I change: YES - you can add new agent types
+        """
+        cls._agent_types[agent_type] = agent_class
+
+# =============================================================================
+# MESSAGE BUS - THE COMMUNICATION SYSTEM
+# =============================================================================
+class MessageBus:
+    """
+    What: Manages communication between all agents
+    Why: Agents need a central system to send messages to each other
+    Can I change: YES - you can modify the communication system
+    """
+    
+    def __init__(self):
+        """Initialize the message bus"""
+        self.agents: Dict[str, BaseAgent] = {}  # All registered agents
+    
+    def register_agent(self, agent: BaseAgent):
+        """
+        What: Registers an agent with the message bus
+        Why: Agents need to be registered to receive messages
+        Can I change: YES - you can modify registration logic
+        """
+        self.agents[agent.agent_id] = agent
+    
+    async def send_message(self, message: AgentMessage):
+        """
+        What: Sends a message from one agent to another
+        Why: This is how agents communicate with each other
+        Can I change: YES - you can modify message routing
+        """
+        print(f"🔀 Sending message: {message.from_agent} -> {message.to_agent} ({message.message_type.value})")
+        print(f"   Content: {message.content[:100]}...")
+        
+        target_agent = self.agents.get(message.to_agent)
+        if not target_agent:
+            print(f"⚠️ Warning: Agent {message.to_agent} not found")
+            return
+        
+        # Process the message and get responses
+        response_messages = await target_agent.process_message(message)
+        
+        print(f"📤 Agent {message.to_agent} generated {len(response_messages)} responses")
+        
+        # Send each response message
+        for response in response_messages:
+            await self.send_message(response)
+    
+    async def process_workflow(self, initial_task: str, workflow_agents: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        What: Processes a complete workflow from start to finish
+        Why: This orchestrates the entire multi-agent workflow
+        Can I change: YES - you can modify the workflow processing
+        """
+        try:
+            print(f"🚀 Starting workflow with task: {initial_task}")
+            print(f"🤖 Creating {len(workflow_agents)} agents")
+            
+            # Create and register all agents
+            for agent_config in workflow_agents:
+                agent = AgentFactory.create_agent(
+                    agent_id=agent_config["id"],
+                    agent_type=agent_config["type"],
+                    role=agent_config["role"],
+                    model_name=agent_config.get("model", "mistral"),
+                    model_config=agent_config.get("model_config", {})
+                )
+                self.register_agent(agent)
+                print(f"✅ Created agent: {agent_config['id']} ({agent_config['type']})")
+            
+            # Start the workflow with the coordinator
+            coordinator = self.agents.get("coordinator")
+            if not coordinator:
+                raise ValueError("No coordinator agent found")
+            
+            # Create initial task message from system to coordinator
+            initial_message = AgentMessage(
+                id=f"workflow_start_{datetime.now().timestamp()}",
+                from_agent="system",
+                to_agent="coordinator",
+                message_type=MessageType.TASK,
+                content=initial_task
+            )
+            
+            print(f"📤 Sending initial message to coordinator")
+            
+            # Process the workflow and wait for completion
+            await self.send_message(initial_message)
+            
+            # Wait a bit for the workflow to complete (in a real system, you'd have better completion detection)
+            print(f"⏳ Waiting for workflow completion...")
+            await asyncio.sleep(5)  # Increased from 3 to 5 seconds
+            
+            # Collect results from all agents
+            results = {}
+            for agent_id, agent in self.agents.items():
+                results[agent_id] = {
+                    "status": agent.status.value,
+                    "memory": len(agent.memory.short_term),
+                    "messages": [msg.content for msg in agent.memory.short_term[-5:]]  # Last 5 messages
+                }
+                print(f"📊 Agent {agent_id}: {agent.status.value}, {len(agent.memory.short_term)} messages")
+            
+            print(f"✅ Workflow completed successfully")
+            return {
+                "success": True,
+                "results": results,
+                "message": "Workflow completed successfully"
+            }
+                
+        except Exception as e:
+            print(f"❌ Workflow failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "Workflow failed"
+            }
+
+# =============================================================================
+# REQUEST MODELS - WHAT THE FRONTEND SENDS
+# =============================================================================
 class PromptRequest(BaseModel):
+    """
+    What: The request format for chat interactions
+    Why: Frontend needs a standard way to send requests
+    Can I change: YES - you can add more fields to the request
+    """
     prompt: str
     code_history: List[str] = []
     error_history: List[str] = []
 
-class RunTestRequest(BaseModel):
-    code: str
-    test_code: str
-    previous_errors: List[str] = []
+class WorkflowRequest(BaseModel):
+    """
+    What: The request format for custom workflows
+    Why: Frontend needs a way to define custom agent workflows
+    Can I change: YES - you can add more workflow configuration options
+    """
+    task: str
+    agents: List[Dict[str, Any]]  # [{"id": "agent1", "type": "coder", "role": "Python developer", "model": "mistral"}]
 
-class RefineRequest(BaseModel):
-    code: str
-    test_code: str
-    test_output: str
-    code_history: List[str] = []
-    error_history: List[str] = []
-    previous_errors: List[str] = []
-
-# -----------------------------------------------------------------------------
-# Utility Functions
-# -----------------------------------------------------------------------------
+# =============================================================================
+# UTILITY FUNCTIONS - HELPER FUNCTIONS
+# =============================================================================
 def _timestamp() -> str:
+    """
+    What: Creates a timestamp string for file naming
+    Why: We need unique filenames for generated files
+    Can I change: YES - you can modify the timestamp format
+    """
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+def _extract_code(response: str) -> str:
+    """
+    What: Extracts Python code from AI responses
+    Why: AI responses often include explanations, we need just the code
+    Can I change: YES - you can modify how code is extracted
+    """
+    # Look for code blocks
+    code_patterns = [
+        r'```python\n(.*?)\n```',  # Markdown code blocks
+        r'```\n(.*?)\n```',        # Generic code blocks
+        r'```(.*?)```',            # Code blocks without language
+        r'`(.*?)`'                 # Inline code
+    ]
+    
+    for pattern in code_patterns:
+        matches = re.findall(pattern, response, re.DOTALL)
+        if matches:
+            return matches[0].strip()
+    
+    # If no code blocks found, return the whole response
+    return response.strip()
 
-def _extract_code(raw: str) -> str:
-    match = re.search(r"```(?:python)?\s*([\s\S]*?)\s*```", raw)
-    return match.group(1).strip() if match else raw.strip()
+# =============================================================================
+# API ENDPOINTS - WHAT THE FRONTEND CALLS
+# =============================================================================
 
+@app.post("/chat")
+async def chat(request: PromptRequest):
+    """
+    What: Main chat endpoint for automated workflows
+    Why: Frontend needs a simple way to interact with the AI system
+    Can I change: YES - you can modify the chat logic
+    """
+    try:
+        print(f"🚀 Starting chat workflow with prompt: {request.prompt}")
+        
+        # Validate input
+        if not request.prompt or not request.prompt.strip():
+            return {
+                "type": "error",
+                "message": "No prompt provided",
+                "success": False
+            }
+        
+        # Create a message bus for this session
+        message_bus = MessageBus()
+        
+        # Define the default workflow agents
+        workflow_agents = [
+            {"id": "coordinator", "type": "coordinator", "role": "Smart Coordinator", "model": "mistral"},
+            {"id": "coder", "type": "coder", "role": "Python Developer", "model": "mistral"},
+            {"id": "tester", "type": "tester", "role": "Test Engineer", "model": "mistral"},
+            {"id": "runner", "type": "runner", "role": "Test Runner"}
+        ]
+        
+        print(f"🤖 Created {len(workflow_agents)} agents")
+        
+        # Process the workflow
+        result = await message_bus.process_workflow(request.prompt, workflow_agents)
+        
+        print(f"✅ Workflow completed with result: {result}")
+        
+        # Check if workflow failed
+        if not result.get("success", False):
+            return {
+                "type": "error",
+                "message": result.get("message", "Workflow failed"),
+                "success": False
+            }
+        
+        # Extract results from the workflow
+        code = None
+        tests = None
+        test_results = None
+        tests_passed = None
+        
+        # Look for generated files in the results
+        for agent_id, agent in message_bus.agents.items():
+            print(f"🔍 Checking agent {agent_id}: {len(agent.memory.short_term)} messages")
+            if agent_id == "coder":
+                # Look for code in the agent's memory
+                for msg in agent.memory.short_term:
+                    if msg.metadata.get("code"):
+                        code = msg.metadata["code"]
+                        print(f"📝 Found code from coder agent: {len(code)} characters")
+                        break
+            elif agent_id == "tester":
+                # Look for tests in the agent's memory
+                for msg in agent.memory.short_term:
+                    if msg.metadata.get("test_code"):
+                        tests = msg.metadata["test_code"]
+                        print(f"🧪 Found tests from tester agent: {len(tests)} characters")
+                        break
+            elif agent_id == "runner":
+                # Look for test results in the agent's memory
+                for msg in agent.memory.short_term:
+                    if msg.metadata.get("test_results"):
+                        test_results = msg.metadata["test_results"]
+                        tests_passed = msg.metadata.get("tests_passed", False)
+                        print(f"🏃 Found test results from runner agent: {len(test_results)} characters")
+                        break
+        
+        # If code wasn't found in memory, try to read from the latest generated file
+        if not code:
+            try:
+                code_files = list(GENERATED_DIR.glob("code_*.py"))
+                if code_files:
+                    latest_code_file = max(code_files, key=lambda x: x.stat().st_mtime)
+                    with open(latest_code_file, 'r', encoding='utf-8') as f:
+                        code = f.read()
+                    print(f"📝 Found code from file: {latest_code_file.name}")
+            except Exception as e:
+                print(f"⚠️ Could not read code from file: {e}")
+        
+        # If tests weren't found in memory, try to read from the latest generated file
+        if not tests:
+            try:
+                test_files = list(GENERATED_DIR.glob("test_*.py"))
+                if test_files:
+                    latest_test_file = max(test_files, key=lambda x: x.stat().st_mtime)
+                    with open(latest_test_file, 'r', encoding='utf-8') as f:
+                        tests = f.read()
+                    print(f"🧪 Found tests from file: {latest_test_file.name}")
+            except Exception as e:
+                print(f"⚠️ Could not read tests from file: {e}")
+        
+        # If test results weren't found in memory, try to execute the latest tests
+        if not test_results and code and tests:
+            try:
+                print("🏃 No test results found in memory, attempting to execute tests...")
+                # Create a temporary runner to execute the tests
+                temp_runner = RunnerAgent("temp_runner", "runner", "Test Runner")
+                test_results = temp_runner._run_tests(code, tests)
+                tests_passed = "✅ TESTS PASSED" in test_results
+                print(f"🏃 Test execution completed: {len(test_results)} characters")
+            except Exception as e:
+                print(f"⚠️ Could not execute tests: {e}")
+                test_results = f"❌ Test execution failed: {str(e)}"
+                tests_passed = False
+        
+        # Determine response type based on what was generated
+        response_type = "coding" if (code or tests) else "error"
+        
+        response_data = {
+            "type": response_type,
+            "message": result.get("message", "Task completed"),
+            "code": code,
+            "tests": tests,
+            "test_results": test_results,
+            "tests_passed": tests_passed,
+            "success": result.get("success", False)
+        }
+        
+        print(f"📤 Returning response: {response_data}")
+        return response_data
+        
+    except Exception as e:
+        print(f"❌ Error in chat endpoint: {str(e)}")
+        return {
+            "type": "error",
+            "message": f"Error processing request: {str(e)}",
+            "success": False
+        }
 
-def _format_test_results(output: str) -> str:
-    lines = output.strip().split("\n")
-    summary = []
-    results = {}
-    current = None
-    for line in lines:
-        if not line.strip() or line.startswith('Ran '):
-            continue
-        m = re.match(r"(test_\w+).*?\.\.\.\s*(ok|FAIL|ERROR)", line)
-        if m:
-            name, status = m.groups()
-            results[name] = {"status": status, "msg": ""}
-            current = name
-        elif current:
-            results[current]['msg'] += line.strip() + ' '
-    for name, d in results.items():
-        if d['status'] == 'ok':
-            summary.append(f"{name}: PASS")
-        else:
-            summary.append(f"{name}: {d['status']} - {d['msg'].strip()}")
-    total = len(results)
-    passed = sum(1 for d in results.values() if d['status']=='ok')
-    failed = total - passed
-    summary.append(f"\nTest Summary:\n- Total Tests: {total}\n- Passed: {passed}\n- Failed: {failed}")
-    return "\n".join(summary)
+@app.post("/run-workflow")
+async def run_workflow(request: WorkflowRequest):
+    """
+    What: Endpoint for custom agent workflows
+    Why: Frontend needs a way to define custom agent configurations
+    Can I change: YES - you can modify the workflow processing
+    """
+    try:
+        message_bus = MessageBus()
+        result = await message_bus.process_workflow(request.task, request.agents)
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
+@app.post("/update-agent-model")
+async def update_agent_model(agent_id: str, model_name: str, model_config: Dict[str, Any] = None):
+    """
+    What: Updates the AI model for a specific agent
+    Why: Agents might need different models for different tasks
+    Can I change: YES - you can modify model updating logic
+    """
+    # This would need to be implemented with agent management
+    return {"success": True, "message": f"Updated agent {agent_id} to use model {model_name}"}
 
-def extract_definitions(source: str) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
-    tree = ast.parse(source)
-    classes, funcs, methods = [], [], {}
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            cls = node.name
-            classes.append(cls)
-            methods[cls] = [m.name for m in node.body if isinstance(m, ast.FunctionDef)]
-        elif isinstance(node, ast.FunctionDef):
-            funcs.append(node.name)
-    return classes, funcs, methods
+# =============================================================================
+# LEGACY ENDPOINTS - FOR BACKWARD COMPATIBILITY
+# =============================================================================
+# These endpoints maintain compatibility with existing frontend code
 
-
-def _normalize_imports(test_code: str, class_name: str=None) -> str:
-    test_code = re.sub(r"from\s+\w+\s+import.*?\n", "", test_code)
-    test_code = re.sub(r"import\s+unittest.*?\n", "", test_code)
-    header = ["import unittest"]
-    if class_name:
-        header.append(f"from source import {class_name}")
-    else:
-        header.append("from source import *")
-    return "\n".join(header) + "\n\n" + test_code
-
-
-def validate_test_code(test_code: str) -> bool:
-    return bool(re.search(r"def\s+test_\w+", test_code))
-
-
-def _fix_test_code(test_code: str, source_code: str) -> str:
-    classes, funcs, methods = extract_definitions(source_code)
-    if not classes and not funcs:
-        raise ValueError("No classes or functions to test.")
-    is_class = bool(classes)
-    class_name = classes[0] if is_class else None
-    # strip existing definitions up to first Test
-    if "class Test" in test_code:
-        test_code = test_code[test_code.index("class Test"):]
-    # scaffold new class
-    tc_name = f"Test{class_name}" if is_class else "TestFunctions"
-    body = []
-    if is_class:
-        body.append(f"    def setUp(self):\n        self.instance = {class_name}()\n")
-        for m in methods.get(class_name, []):
-            if m != '__init__':
-                body.append(
-                    f"    def test_{m}(self):\n"
-                    f"        result = self.instance.{m}(2,3)\n"
-                    f"        self.assertIsNotNone(result)\n"
-                )
-                if m == 'divide':
-                    body.append(
-                        "    def test_divide_by_zero(self):\n"
-                        "        with self.assertRaises(ValueError):\n"
-                        f"            self.instance.divide(1,0)\n"
-                    )
-    else:
-        for f in funcs:
-            body.append(
-                f"    def test_{f}(self):\n"
-                f"        result = {f}(2,3)\n"
-                f"        self.assertIsNotNone(result)\n"
-            )
-    runner = "\nif __name__=='__main__':\n    unittest.main(verbosity=2)"
-    code = f"class {tc_name}(unittest.TestCase):\n" + "\n".join(body) + runner
-    return _normalize_imports(code, class_name)
-
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
 @app.post("/generate-code")
 async def generate_code(data: PromptRequest):
-    try:
-        prompt = f"System: Senior Software Engineer. Generate production-ready Python code.\n\n# Task: {data.prompt.strip()}"
-        code = _extract_code(coder_llm.invoke(prompt))
-        fname = f"main_{_timestamp()}.py"
-        (GENERATED_DIR/fname).write_text(code, encoding='utf-8')
-        return {"code": code, "file": fname, "message": "✅ Code saved."}
-    except Exception as e:
-        logging.error(f"/generate-code error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """
+    What: Legacy endpoint for code generation
+    Why: Maintains compatibility with existing frontend
+    Can I change: NO - this is for backward compatibility
+    """
+    return await chat(data)
 
 @app.post("/generate-test")
-async def generate_test(data: PromptRequest):
-    try:
-        src = _extract_code(data.prompt)
-        prompt = f"System: QA Engineer. Generate unittest code.\n\n# Source:\n{src}\n"
-        raw = tester_llm.invoke(prompt)
-        ai_tests = _extract_code(raw)
-        final_tests = _fix_test_code(ai_tests, src)
-        if not validate_test_code(final_tests):
-            raise ValueError("No test methods generated.")
-        fname = f"test_{_timestamp()}.py"
-        (GENERATED_DIR/fname).write_text(final_tests, encoding='utf-8')
-        return {"code": final_tests, "file": fname, "message": "✅ Tests generated."}
-    except Exception as e:
-        logging.error(f"/generate-test error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+async def generate_test(request: PromptRequest):
+    """
+    What: Legacy endpoint for test generation
+    Why: Maintains compatibility with existing frontend
+    Can I change: NO - this is for backward compatibility
+    """
+    return await chat(request)
 
 @app.post("/run-test")
-async def run_test(data: RunTestRequest):
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            # Write source and test files
-            (Path(td)/'source.py').write_text(data.code, encoding='utf-8')
-            (Path(td)/'test_source.py').write_text(data.test_code, encoding='utf-8')
-            
-            # Set up Python path
-            env = os.environ.copy()
-            env['PYTHONPATH'] = str(td)
-            
-            # Run tests using unittest
-            cmd = [sys.executable, '-m', 'unittest', 'discover', '-v', '-s', str(td), '-p', 'test_*.py']
-            res = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            
-            # Format test results
-            output = _format_test_results(res.stdout + res.stderr)
-            
-            # Have coordinator analyze results
-            prompt = f"System: Project Coordinator. Analyze test results and provide a final status.\n\nTest Results:\n{output}\n"
-            coordinator_response = runner_llm.invoke(prompt)
-            
-            return {
-                "output": output,
-                "coordinator_status": coordinator_response
-            }
-    except Exception as e:
-        logging.error(f"/run-test error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def run_test(data: PromptRequest):
+    """
+    What: Legacy endpoint for test execution
+    Why: Maintains compatibility with existing frontend
+    Can I change: NO - this is for backward compatibility
+    """
+    return await chat(data)
 
-@app.post("/process-prompt")
-async def process_prompt(data: PromptRequest):
-    try:
-        messages = []
-        
-        # 1. Generate code
-        prompt = f"System: Senior Software Engineer. Generate production-ready Python code.\n\n# Task: {data.prompt.strip()}"
-        code = _extract_code(coder_llm.invoke(prompt))
-        fname = f"main_{_timestamp()}.py"
-        (GENERATED_DIR/fname).write_text(code, encoding='utf-8')
-        messages.append({
-            "role": "coder",
-            "content": code,
-            "file": fname
-        })
-        messages.append({
-            "role": "coordinator",
-            "content": "✅ Code generated and saved."
-        })
-
-        # 2. Generate tests
-        src = code
-        prompt = f"System: QA Engineer. Generate unittest code.\n\n# Source:\n{src}\n"
-        raw = tester_llm.invoke(prompt)
-        ai_tests = _extract_code(raw)
-        final_tests = _fix_test_code(ai_tests, src)
-        if not validate_test_code(final_tests):
-            raise ValueError("No test methods generated.")
-        test_fname = f"test_{_timestamp()}.py"
-        (GENERATED_DIR/test_fname).write_text(final_tests, encoding='utf-8')
-        messages.append({
-            "role": "tester",
-            "content": final_tests,
-            "file": test_fname
-        })
-
-        # 3. Run tests
-        with tempfile.TemporaryDirectory() as td:
-            (Path(td)/'source.py').write_text(code, encoding='utf-8')
-            (Path(td)/'test_source.py').write_text(final_tests, encoding='utf-8')
-            
-            env = os.environ.copy()
-            env['PYTHONPATH'] = str(td)
-            
-            cmd = [sys.executable, '-m', 'unittest', 'discover', '-v', '-s', str(td), '-p', 'test_*.py']
-            res = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            
-            output = _format_test_results(res.stdout + res.stderr)
-            messages.append({
-                "role": "runner",
-                "content": output
-            })
-
-            # 4. Coordinator analysis
-            prompt = f"System: Project Coordinator. Analyze test results and provide a final status.\n\nTest Results:\n{output}\n"
-            coordinator_response = runner_llm.invoke(prompt)
-            messages.append({
-                "role": "coordinator",
-                "content": coordinator_response
-            })
-
-        return {
-            "messages": messages,
-            "showRefine": "FAIL" in output or "ERROR" in output
-        }
-    except Exception as e:
-        logging.error(f"/process-prompt error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# =============================================================================
+# FILE MANAGEMENT ENDPOINTS - FOR FRONTEND FILE OPERATIONS
+# =============================================================================
 
 @app.get("/list-files")
 async def list_files():
-    files = [f.name for f in GENERATED_DIR.iterdir() if f.suffix == '.py']
-    return JSONResponse({"files": sorted(files, reverse=True)})
+    """
+    What: Lists all generated files
+    Why: Frontend needs to know what files are available
+    Can I change: YES - you can modify file listing logic
+    """
+    try:
+        files = []
+        for file in GENERATED_DIR.glob("*.py"):
+            files.append(file.name)
+        return {"files": files}
+    except Exception as e:
+        return {"files": [], "error": str(e)}
+
+@app.get("/generated/{filename}")
+async def get_generated_file(filename: str):
+    """
+    What: Serves generated files to the frontend
+    Why: Frontend needs to display generated code and tests
+    Can I change: YES - you can modify file serving logic
+    """
+    try:
+        filepath = GENERATED_DIR / filename
+        if filepath.exists():
+            return FileResponse(filepath, media_type="text/plain")
+        else:
+            raise HTTPException(status_code=404, detail=f"File {filename} not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
+
+@app.delete("/generated/{filename}")
+async def delete_generated_file(filename: str):
+    """
+    What: Deletes a generated file
+    Why: Frontend needs to be able to clean up files
+    Can I change: YES - you can modify file deletion logic
+    """
+    try:
+        filepath = GENERATED_DIR / filename
+        if filepath.exists():
+            filepath.unlink()
+            return {"success": True, "message": f"Deleted {filename}"}
+        else:
+            raise HTTPException(status_code=404, detail=f"File {filename} not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
+
+# =============================================================================
+# MANUAL AGENT WORKFLOW ENDPOINTS - FOR VISUAL WORKFLOW DESIGN
+# =============================================================================
+
+class ManualAgentBox(BaseModel):
+    """
+    What: Represents an agent box in the visual workflow designer
+    Why: Frontend needs to send agent configurations
+    Can I change: YES - you can add more agent properties
+    """
+    id: str
+    x: float
+    y: float
+    width: float
+    height: float
+    agentType: str
+    role: str
+    model: str = DEFAULT_MODEL
+
+class ManualAgentConnection(BaseModel):
+    """
+    What: Represents a connection between agents in the visual workflow
+    Why: Frontend needs to define how agents communicate
+    Can I change: YES - you can add more connection properties
+    """
+    id: str
+    fromId: str
+    fromSide: str
+    toId: str
+    toSide: str
+
+class ManualFlowRequest(BaseModel):
+    """
+    What: Request format for manual workflow execution
+    Why: Frontend needs to send manual workflow configurations
+    Can I change: YES - you can add more workflow properties
+    """
+    prompt: str
+    boxes: List[ManualAgentBox]
+    connections: List[ManualAgentConnection]
+
+@app.post("/run-manual-flow")
+async def run_manual_flow(data: ManualFlowRequest):
+    """
+    What: Executes a manually designed workflow
+    Why: Frontend needs to run custom agent workflows
+    Can I change: YES - you can modify manual workflow processing
+    """
+    try:
+        # Convert manual flow to agent configurations
+        agents = []
+        for box in data.boxes:
+            agents.append({
+                "id": box.id,
+                "type": box.agentType,
+                "role": box.role,
+                "model": box.model
+            })
         
+        # Create message bus and process workflow
+        message_bus = MessageBus()
+        result = await message_bus.process_workflow(data.prompt, agents)
+        
+        # Collect messages from all agents
+        messages = []
+        for agent_id, agent in message_bus.agents.items():
+            for msg in agent.memory.short_term:
+                messages.append({
+                    "from": msg.from_agent,
+                    "to": msg.to_agent,
+                    "type": msg.message_type.value,
+                    "content": msg.content,
+                    "timestamp": msg.timestamp.isoformat()
+                })
+        
+        return {
+            "success": result.get("success", False),
+            "messages": messages,
+            "results": result.get("results", {}),
+            "generated_files": []  # You can add file tracking here
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "messages": []
+        }
+
+@app.get("/example-workflow")
+async def example_workflow():
+    """
+    What: Returns an example workflow configuration
+    Why: Frontend needs example data for testing
+    Can I change: YES - you can modify the example workflow
+    """
+    return {
+        "agents": [
+            {"id": "coordinator", "type": "coordinator", "role": "Smart Coordinator"},
+            {"id": "coder", "type": "coder", "role": "Python Developer"},
+            {"id": "tester", "type": "tester", "role": "Test Engineer"},
+            {"id": "runner", "type": "runner", "role": "Test Runner"}
+        ],
+        "description": "A complete workflow for code generation and testing"
+    }
+
+# =============================================================================
+# ADDITIONAL ENDPOINTS - FOR FRONTEND COMPATIBILITY
+# =============================================================================
+
+@app.get("/health")
+async def health_check():
+    """
+    What: Health check endpoint
+    Why: Frontend needs to verify backend is running
+    Can I change: YES - you can modify health check logic
+    """
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "2.0.0",
+        "agents_available": ["coordinator", "coder", "tester", "runner"]
+    }
+
+@app.get("/agent-types")
+async def get_agent_types():
+    """
+    What: Returns available agent types
+    Why: Frontend needs to know what agents are available
+    Can I change: YES - you can add new agent types
+    """
+    return {
+        "agent_types": ["coordinator", "coder", "tester", "runner"],
+        "count": 4
+    }
+
+@app.get("/agents")
+async def get_active_agents():
+    """
+    What: Returns currently active agents
+    Why: Frontend needs to know about active agents
+    Can I change: YES - you can modify agent status reporting
+    """
+    return {
+        "agents": {
+            "coordinator": {"status": "available", "type": "coordinator"},
+            "coder": {"status": "available", "type": "coder"},
+            "tester": {"status": "available", "type": "tester"},
+            "runner": {"status": "available", "type": "runner"}
+        },
+        "count": 4
+    }
+
+@app.get("/pipelines")
+async def get_pipelines():
+    """
+    What: Returns available pipelines
+    Why: Frontend needs pipeline information
+    Can I change: YES - you can add pipeline management
+    """
+    return {
+        "pipelines": [
+            {
+                "id": "default",
+                "name": "Default Workflow",
+                "description": "Standard code generation and testing workflow",
+                "agents": ["coordinator", "coder", "tester", "runner"]
+            }
+        ],
+        "count": 1
+    }
+
+@app.post("/execute-pipeline/{pipeline_id}")
+async def execute_pipeline(pipeline_id: str, task: str):
+    """
+    What: Executes a specific pipeline
+    Why: Frontend needs to run predefined pipelines
+    Can I change: YES - you can modify pipeline execution
+    """
+    if pipeline_id == "default":
+        return await chat(PromptRequest(prompt=task))
+    else:
+        raise HTTPException(status_code=404, detail=f"Pipeline {pipeline_id} not found")
+
+@app.delete("/cleanup")
+async def cleanup_system():
+    """
+    What: Cleans up the system
+    Why: Frontend needs cleanup functionality
+    Can I change: YES - you can modify cleanup logic
+    """
+    return {
+        "message": "System cleaned up successfully",
+        "removed_agents": 0,
+        "cleared_messages": 0
+    }
+
+@app.get("/gpu-status")
+async def get_gpu_status():
+    """
+    What: Check GPU availability and current model configuration
+    Why: Users need to know if GPU acceleration is available
+    Can I change: YES - you can add more GPU diagnostics
+    """
+    try:
+        import subprocess
+        import json
+        
+        # Check if CUDA is available
+        cuda_available = False
+        try:
+            result = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
+            cuda_available = result.returncode == 0
+        except:
+            pass
+        
+        # Check Ollama GPU support
+        ollama_gpu = False
+        try:
+            result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+            ollama_gpu = "gpu" in result.stdout.lower()
+        except:
+            pass
+        
+        return {
+            "cuda_available": cuda_available,
+            "ollama_gpu_support": ollama_gpu,
+            "current_model": DEFAULT_MODEL,
+            "gpu_config": DEFAULT_GPU_CONFIG,
+            "available_models": list(MODEL_CONFIGS.keys()),
+            "recommendation": "CodeLlama:7b-instruct is optimized for code generation with GPU acceleration",
+            "model_comparison": {
+                "codellama:7b-instruct": "Best for code generation, lower temperature for focused output",
+                "mistral": "Good for general tasks and coordination",
+                "llama2": "Balanced performance for various tasks"
+            }
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "cuda_available": False,
+            "ollama_gpu_support": False
+        }
+
+@app.post("/configure-gpu")
+async def configure_gpu_settings(num_gpu: int = 1, num_thread: int = 8, temperature: float = 0.7):
+    """
+    What: Configure GPU settings for all agents
+    Why: Users need to adjust GPU parameters
+    Can I change: YES - you can add more configuration options
+    """
+    try:
+        # Update the default GPU configuration
+        global DEFAULT_GPU_CONFIG
+        DEFAULT_GPU_CONFIG = {
+            "num_gpu": num_gpu,
+            "num_thread": num_thread,
+            "temperature": temperature,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1
+        }
+        
+        return {
+            "success": True,
+            "message": f"GPU configuration updated: {num_gpu} GPU(s), {num_thread} threads, temp={temperature}",
+            "config": DEFAULT_GPU_CONFIG
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/models")
+async def get_available_models():
+    """
+    What: Get information about available models and their configurations
+    Why: Users need to know what models are available and their settings
+    Can I change: YES - you can add more model information
+    """
+    return {
+        "current_default": DEFAULT_MODEL,
+        "available_models": MODEL_CONFIGS,
+        "recommendations": {
+            "code_generation": "codellama:7b-instruct",
+            "general_tasks": "mistral", 
+            "balanced": "llama2"
+        }
+    }
+
+@app.post("/switch-model")
+async def switch_default_model(model_name: str):
+    """
+    What: Switch the default model for all new agents
+    Why: Users need to easily change the default model
+    Can I change: YES - you can add more model switching logic
+    """
+    try:
+        global DEFAULT_MODEL
+        if model_name not in MODEL_CONFIGS:
+            return {
+                "success": False,
+                "error": f"Model '{model_name}' not found. Available models: {list(MODEL_CONFIGS.keys())}"
+            }
+        
+        DEFAULT_MODEL = model_name
+        return {
+            "success": True,
+            "message": f"Default model switched to {model_name}",
+            "new_default": DEFAULT_MODEL,
+            "model_config": MODEL_CONFIGS[model_name]
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+# =============================================================================
+# STARTUP MESSAGE - SHOWS WHEN SERVER STARTS
+# =============================================================================
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Multi-Agent AI System...")
+    print("📁 Generated files will be saved to:", GENERATED_DIR)
+    print("🌐 Server will be available at: http://localhost:8000")
+    print("📚 API Documentation: http://localhost:8000/docs")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

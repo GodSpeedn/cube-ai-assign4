@@ -57,7 +57,7 @@ declare const process: {
   };
 };
 
-const AgentVisualization: React.FC<AgentVisualizationProps> = ({ 
+const AgentVisualization: React.FC<AgentVisualizationProps> = ({
   isDark, 
   interactions = [],
   onPromptSubmit 
@@ -136,8 +136,7 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
   };
 
   /**
-   * Retrieves messages exchanged between two agents
-   * Filters messages based on sender and receiver
+   * Enhanced function to get detailed communication messages with better formatting
    */
   const getCommunicationMessages = (from: string, to: string): AIBlock[] => {
     console.log('[COMM]', { from, to });
@@ -184,67 +183,77 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
   };
 
   /**
-   * Extracts the actual content from a message, removing communication metadata
+   * Enhanced function to extract and format communication content with command/response structure
    */
-  const extractContent = (content: string): string => {
-    // Remove communication headers and metadata
+  const extractCommunicationContent = (message: AIBlock): { 
+    type: 'command' | 'response' | 'info', 
+    content: string, 
+    instruction?: string,
+    details?: string 
+  } => {
+    const content = message.content;
+    
+    // Detect if this is a command/instruction from coordinator
+    if (message.type === 'coordinator' && content.includes('generate')) {
+      return {
+        type: 'command',
+        content: content,
+        instruction: content.includes('code') ? 'GENERATE CODE' :
+                    content.includes('test') ? 'GENERATE TESTS' :
+                    content.includes('run') ? 'RUN TESTS' : 'EXECUTE TASK',
+        details: content.replace(/^(Instructing|Reporting to).*?:/g, '').trim()
+      };
+    }
+    
+    // Detect if this is a response with generated content
+    if ((message.type === 'coder' || message.type === 'tester') && content.includes('```')) {
+      const codeMatch = content.match(/```(?:python)?\s*([\s\S]*?)\s*```/);
+      const codeContent = codeMatch ? codeMatch[1].trim() : '';
+      return {
+        type: 'response',
+        content: content,
+        instruction: message.type === 'coder' ? 'CODE GENERATED' : 'TESTS GENERATED',
+        details: codeContent ? `Generated ${codeContent.split('\n').length} lines of code` : 'Generated code/tests'
+      };
+    }
+    
+    // Detect if this is a test execution result
+    if (message.type === 'runner' && (content.includes('test') || content.includes('PASS') || content.includes('FAIL'))) {
+      return {
+        type: 'response',
+        content: content,
+        instruction: 'TEST EXECUTION RESULT',
+        details: content.includes('PASS') ? '✅ Tests Passed' : 
+                content.includes('FAIL') ? '❌ Tests Failed' : 'Test execution completed'
+      };
+    }
+    
+    // Default formatting for other messages
     let cleanContent = content
         .replace(/^(Reporting to|Instructing) .*?:/g, '')
         .replace(/Current program state:.*$/gm, '')
         .replace(/Context:.*$/gm, '')
-        .replace(/"requirements":.*$/gm, '')
-        .replace(/"dependencies":.*$/gm, '')
-        .replace(/"constraints":.*$/gm, '')
-        .replace(/"previousResults":.*$/gm, '')
-        .replace(/{.*}/g, '')
+        .trim();
+    
+    return {
+      type: 'info',
+      content: cleanContent,
+      details: cleanContent
+    };
+  };
+
+  /**
+   * Backward compatibility function for extracting content in AgentBox
+   */
+  const extractContent = (content: string): string => {
+    // Simple version for individual agent boxes - just clean up basic metadata
+    let cleanContent = content
+        .replace(/^(Reporting to|Instructing) .*?:/g, '')
+        .replace(/Current program state:.*$/gm, '')
+        .replace(/Context:.*$/gm, '')
         .trim();
 
-    // Extract code blocks with language
-    const codeBlocks: string[] = [];
-    let match;
-    const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
-    
-    while ((match = codeBlockRegex.exec(cleanContent)) !== null) {
-        const language = match[1] || 'python';
-        const code = match[2].trim();
-        codeBlocks.push(`Generated ${language} code:\n${code}`);
-    }
-    
-    if (codeBlocks.length > 0) {
-        return codeBlocks.join('\n\n');
-    }
-
-    // For test results
-    if (cleanContent.includes('Test Results:')) {
-        const testResults = cleanContent.split('Test Results:')[1].trim();
-        return `Test Results:\n${testResults}`;
-    }
-
-    // For generated files
-    if (cleanContent.includes('Generated file:')) {
-        const fileContent = cleanContent.split('Generated file:')[1].trim();
-        return `Generated file:\n${fileContent}`;
-    }
-
-    // For requirements breakdown
-    if (cleanContent.includes('Breaking down requirements:')) {
-        const requirements = cleanContent.split('Breaking down requirements:')[1].trim();
-        return `Requirements Breakdown:\n${requirements}`;
-    }
-
-    // For test generation
-    if (cleanContent.includes('Generating tests for:')) {
-        const testGen = cleanContent.split('Generating tests for:')[1].trim();
-        return `Test Generation:\n${testGen}`;
-    }
-
-    // For test execution
-    if (cleanContent.includes('Executing tests:')) {
-        const testExec = cleanContent.split('Executing tests:')[1].trim();
-        return `Test Execution:\n${testExec}`;
-    }
-
-    // For other content, remove status messages
+    // Remove status messages
     if (cleanContent.match(/^(Starting|Ready|Complete|Finished)/i)) {
         return '';
     }
@@ -520,8 +529,7 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
   };
 
   /**
-   * Communication popup component
-   * Shows messages exchanged between connected agents
+   * Enhanced communication popup with better command/response formatting
    */
   const CommunicationPopup = () => {
     if (!selectedConnection) return null;
@@ -531,8 +539,8 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
     const centerPoint = selectedConnection.centerPoint;
 
     // Calculate popup position to ensure it's always visible within the container
-    const popupWidth = 500; // Increased width for better formatting
-    const popupHeight = 400; // Increased height for better visibility
+    const popupWidth = 600; // Increased width for better formatting
+    const popupHeight = 500; // Increased height for better visibility
     
     // Get container bounds
     const containerRect = containerRef.current?.getBoundingClientRect();
@@ -570,67 +578,155 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
       <div 
         className={`absolute transform -translate-x-1/2 -translate-y-1/2 rounded-lg border-2 ${
           isDark ? 'border-gray-600 bg-gray-800' : 'border-gray-300 bg-white'
-        } shadow-lg p-4`}
+        } shadow-xl p-4`}
         style={{
           left: `${left}px`,
           top: `${top}px`,
           width: popupWidth,
           zIndex: 1000,
-          maxHeight: '80vh',
+          maxHeight: '85vh',
           overflow: 'hidden'
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className={`flex justify-between items-center mb-4 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-          <h3 className="font-semibold text-lg">
-            {selectedConnection.from} ↔ {selectedConnection.to}
-          </h3>
+        {/* Header */}
+        <div className={`flex justify-between items-center mb-4 ${isDark ? 'text-gray-300' : 'text-gray-700'} border-b pb-3 ${isDark ? 'border-gray-600' : 'border-gray-200'}`}>
+          <div>
+            <h3 className="font-semibold text-lg">
+              Agent Communication
+            </h3>
+            <div className="text-sm text-gray-500">
+              {selectedConnection.from} ↔ {selectedConnection.to}
+            </div>
+          </div>
           <button
             onClick={() => setSelectedConnection(null)}
-            className={`p-1 rounded ${
-              isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-200'
-            }`}
+            className={`p-2 rounded-full hover:bg-opacity-10 ${
+              isDark ? 'hover:bg-white' : 'hover:bg-black'
+            } transition-colors`}
           >
             ✕
           </button>
         </div>
-        <div className={`overflow-y-auto ${isDark ? 'text-gray-300' : 'text-gray-700'}`} style={{ maxHeight: 'calc(80vh - 4rem)' }}>
+
+        {/* Messages */}
+        <div className={`overflow-y-auto ${isDark ? 'text-gray-300' : 'text-gray-700'}`} style={{ maxHeight: 'calc(85vh - 6rem)' }}>
           {conversationGroups.length === 0 ? (
-            <div className="text-center py-4 text-gray-500">
-              No messages exchanged between these agents yet.
+            <div className="text-center py-8">
+              <div className="text-4xl mb-4">💬</div>
+              <div className="text-gray-500 mb-2">No communication yet</div>
+              <div className="text-sm text-gray-400">
+                Messages between {selectedConnection.from} and {selectedConnection.to} will appear here
+              </div>
             </div>
           ) : (
             conversationGroups.map((group, groupIndex) => (
               <div key={groupIndex} className="mb-6 last:mb-0">
-                <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'} mb-2`}>
-                  {new Date(group[0].timestamp).toLocaleTimeString()}
+                {/* Conversation timestamp */}
+                <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'} mb-3 text-center`}>
+                  📅 {new Date(group[0].timestamp).toLocaleString()}
                 </div>
-                <div className={`space-y-3 ${isDark ? 'bg-gray-700/50' : 'bg-gray-50'} rounded-lg p-3`}>
-                  {group.map((message) => (
-                    <div key={message.id} className="relative">
-                      <div className={`font-medium mb-1 ${
-                        message.type === 'coordinator' ? 'text-blue-400' :
-                        message.type === 'coder' ? 'text-green-400' :
-                        message.type === 'tester' ? 'text-yellow-400' :
-                        'text-purple-400'
+                
+                {/* Messages in this conversation */}
+                <div className="space-y-4">
+                  {group.map((message, messageIndex) => {
+                    const commData = extractCommunicationContent(message);
+                    const isCommand = commData.type === 'command';
+                    const isResponse = commData.type === 'response';
+                    
+                    return (
+                      <div key={message.id} className={`relative ${
+                        isCommand ? 'ml-0 mr-8' : isResponse ? 'ml-8 mr-0' : 'mx-4'
                       }`}>
-                        {message.name}
+                        {/* Message bubble */}
+                        <div className={`relative rounded-xl p-4 ${
+                          isCommand 
+                            ? isDark ? 'bg-blue-900/30 border-l-4 border-blue-400' : 'bg-blue-50 border-l-4 border-blue-500'
+                            : isResponse 
+                            ? isDark ? 'bg-green-900/30 border-r-4 border-green-400' : 'bg-green-50 border-r-4 border-green-500'
+                            : isDark ? 'bg-gray-700/50' : 'bg-gray-100'
+                        }`}>
+                          
+                          {/* Agent name and role */}
+                          <div className="flex items-center justify-between mb-2">
+                            <div className={`font-medium text-sm ${
+                              message.type === 'coordinator' ? 'text-blue-400' :
+                              message.type === 'coder' ? 'text-green-400' :
+                              message.type === 'tester' ? 'text-yellow-400' :
+                              'text-purple-400'
+                            }`}>
+                              {message.name}
+                              {isCommand && <span className="ml-2 text-xs bg-blue-600 text-white px-2 py-1 rounded">COMMAND</span>}
+                              {isResponse && <span className="ml-2 text-xs bg-green-600 text-white px-2 py-1 rounded">RESPONSE</span>}
+                            </div>
+                            <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                              {new Date(message.timestamp).toLocaleTimeString()}
+                            </div>
+                          </div>
+
+                          {/* Instruction/Command type */}
+                          {commData.instruction && (
+                            <div className={`text-xs font-mono mb-2 px-2 py-1 rounded ${
+                              isCommand 
+                                ? isDark ? 'bg-blue-800/50 text-blue-200' : 'bg-blue-100 text-blue-800'
+                                : isDark ? 'bg-green-800/50 text-green-200' : 'bg-green-100 text-green-800'
+                            }`}>
+                              {commData.instruction}
+                            </div>
+                          )}
+
+                          {/* Message content */}
+                          <div className="text-sm">
+                            {commData.details && commData.details !== commData.content ? (
+                              <div className="space-y-2">
+                                <div className="font-medium">{commData.details}</div>
+                                {/* Show code preview if available */}
+                                {commData.content.includes('```') && (
+                                  <details className="mt-2">
+                                    <summary className="cursor-pointer text-xs text-gray-500 hover:text-gray-400">
+                                      👁️ View generated code
+                                    </summary>
+                                    <pre className={`text-xs mt-2 p-2 rounded overflow-x-auto ${
+                                      isDark ? 'bg-gray-900 text-gray-300' : 'bg-white text-gray-700'
+                                    }`}>
+                                      {commData.content.match(/```(?:python)?\s*([\s\S]*?)\s*```/)?.[1] || commData.content}
+                                    </pre>
+                                  </details>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="whitespace-pre-wrap">
+                                {commData.content.split('\n').slice(0, 3).map((line, i) => (
+                                  <div key={i}>{line}</div>
+                                ))}
+                                {commData.content.split('\n').length > 3 && (
+                                  <details className="mt-1">
+                                    <summary className="cursor-pointer text-xs text-gray-500">
+                                      Show more...
+                                    </summary>
+                                    <div className="mt-1">
+                                      {commData.content.split('\n').slice(3).map((line, i) => (
+                                        <div key={i}>{line}</div>
+                                      ))}
+                                    </div>
+                                  </details>
+                                )}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Communication flow arrow */}
+                          {messageIndex < group.length - 1 && (
+                            <div className={`absolute -bottom-2 ${
+                              isCommand ? 'right-4' : 'left-4'
+                            } text-xs ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                              {isCommand ? '📤' : '📥'}
+                            </div>
+                          )}
+                        </div>
                       </div>
-                      <div className="text-sm">
-                        {message.content.split('\n').map((line, i) => {
-                          if (line.includes('Current program state:') || 
-                              line.includes('Context:') ||
-                              line.includes('```')) {
-                            return null;
-                          }
-                          return <div key={i}>{line}</div>;
-                        })}
-                      </div>
-                      <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'} mt-1`}>
-                        {new Date(message.timestamp).toLocaleTimeString()}
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             ))
