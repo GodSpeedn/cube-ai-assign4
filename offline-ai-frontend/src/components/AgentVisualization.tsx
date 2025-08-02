@@ -783,7 +783,7 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
     <div className="w-full h-full flex flex-col">
       {/* Prompt Input Section */}
       <div className={`p-4 ${isDark ? 'bg-gray-800' : 'bg-gray-100'} border-b ${isDark ? 'border-gray-700' : 'border-gray-200'} flex-shrink-0`}>
-        <form onSubmit={handlePromptSubmit} className="flex gap-2 max-w-3xl mx-auto">
+        <div className="flex gap-2 max-w-3xl mx-auto">
           <input
             type="text"
             value={prompt}
@@ -794,9 +794,25 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
                 ? 'bg-gray-700 text-white placeholder-gray-400' 
                 : 'bg-white text-gray-900 placeholder-gray-500'
             }`}
+            onKeyPress={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                if (prompt.trim() && onPromptSubmit) {
+                  onPromptSubmit(prompt.trim());
+                  setPrompt('');
+                }
+              }
+            }}
           />
           <button
-            type="submit"
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              if (prompt.trim() && onPromptSubmit) {
+                onPromptSubmit(prompt.trim());
+                setPrompt('');
+              }
+            }}
             className={`px-4 py-2 rounded ${
               isDark 
                 ? 'bg-blue-600 hover:bg-blue-700' 
@@ -805,7 +821,7 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
           >
             Send
           </button>
-        </form>
+        </div>
       </div>
 
       {/* Main Visualization Container */}
@@ -822,16 +838,6 @@ const AgentVisualization: React.FC<AgentVisualizationProps> = ({
           }}
           onClick={() => setSelectedConnection(null)}
         >
-          {process.env.NODE_ENV === 'development' && (
-            <div
-              className="absolute top-2 right-2 p-2 bg-white/80 dark:bg-gray-700/80 text-xs font-mono overflow-auto max-h-40 w-64 z-50">
-              <strong>RAW INTERACTIONS:</strong>
-              <pre>{JSON.stringify(interactions, null, 2)}</pre>
-              <strong>POINTS:</strong>
-              <pre>{JSON.stringify(getConnectionPoints(), null, 2)}</pre>
-              <strong>SELECTED:</strong> {selectedConnection?.id ?? '–'}
-            </div>
-          )}
           <ConnectionLines />
           <div className="relative z-10">
             <AgentBox id="coder" title="Coder Agent (Mistral)" type="coder" />

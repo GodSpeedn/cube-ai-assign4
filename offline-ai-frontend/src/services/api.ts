@@ -11,6 +11,7 @@ export interface ChatRequest {
   prompt: string;
   code_history?: string[];
   error_history?: string[];
+  conversation_id?: string;
 }
 
 export interface ChatResponse {
@@ -65,6 +66,35 @@ export interface WorkflowResult {
   agents: Record<string, AgentStatus>;
   message_history: AgentMessage[];
   total_messages: number;
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface ConversationMessage {
+  id: string;
+  from_agent: string;
+  to_agent: string;
+  message_type: string;
+  content: string;
+  timestamp: string;
+  metadata: any;
+}
+
+export interface ConversationDetail {
+  conversation: {
+    id: string;
+    title: string;
+    created_at: string;
+    updated_at: string;
+    is_active: boolean;
+  };
+  messages: ConversationMessage[];
 }
 
 /**
@@ -275,6 +305,59 @@ export async function getExampleWorkflow(): Promise<any> {
     return await response.json();
   } catch (error) {
     console.error('Get example workflow API error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Conversation Management Functions
+ */
+
+export async function getConversations(): Promise<Conversation[]> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/conversations`);
+    if (!response.ok) throw new Error('Failed to fetch conversations');
+    return await response.json();
+  } catch (error) {
+    console.error('Get conversations error:', error);
+    throw error;
+  }
+}
+
+export async function createConversation(title: string): Promise<{ conversation_id: string; title: string }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/conversations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title })
+    });
+    if (!response.ok) throw new Error('Failed to create conversation');
+    return await response.json();
+  } catch (error) {
+    console.error('Create conversation error:', error);
+    throw error;
+  }
+}
+
+export async function getConversation(conversationId: string): Promise<ConversationDetail> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/conversations/${conversationId}`);
+    if (!response.ok) throw new Error('Failed to get conversation');
+    return await response.json();
+  } catch (error) {
+    console.error('Get conversation error:', error);
+    throw error;
+  }
+}
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/conversations/${conversationId}`, {
+      method: 'DELETE'
+    });
+    if (!response.ok) throw new Error('Failed to delete conversation');
+  } catch (error) {
+    console.error('Delete conversation error:', error);
     throw error;
   }
 } 

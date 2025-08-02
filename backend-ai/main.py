@@ -24,20 +24,55 @@ from pydantic import BaseModel
 
 from langchain_ollama import OllamaLLM
 
+# Database integration
+from database import SafeDatabaseIntegration, ConversationRequest, ConversationResponse, ChatRequestWithConversation
+
 # =============================================================================
 # GLOBAL CONFIGURATION
 # =============================================================================
 
+# GPU Detection and Configuration
+def detect_gpu():
+    """Detect if GPU is available and configure accordingly"""
+    try:
+        import subprocess
+        result = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
+        if result.returncode == 0:
+            print("✅ GPU detected - using GPU acceleration")
+            return {
+                "num_gpu": 1,  # Use 1 GPU
+                "num_thread": 8,  # Number of CPU threads
+                "temperature": 0.3,  # Lower temperature for more focused code generation
+                "top_p": 0.9,  # Nucleus sampling
+                "repeat_penalty": 1.1,  # Prevent repetition
+                "top_k": 40,  # Top-k sampling for better code quality
+                "num_ctx": 4096,  # Context window size
+            }
+        else:
+            print("⚠️ GPU not detected - using CPU only")
+            return {
+                "num_gpu": 0,  # No GPU
+                "num_thread": 8,  # Number of CPU threads
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "repeat_penalty": 1.1,
+                "top_k": 40,
+                "num_ctx": 4096,
+            }
+    except Exception as e:
+        print(f"⚠️ Could not detect GPU: {e} - using CPU only")
+        return {
+            "num_gpu": 0,  # No GPU
+            "num_thread": 8,  # Number of CPU threads
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+            "top_k": 40,
+            "num_ctx": 4096,
+        }
+
 # Default GPU configuration for all agents - Optimized for CodeLlama:7b-instruct
-DEFAULT_GPU_CONFIG = {
-    "num_gpu": 1,  # Use 1 GPU
-    "num_thread": 8,  # Number of CPU threads
-    "temperature": 0.3,  # Lower temperature for more focused code generation
-    "top_p": 0.9,  # Nucleus sampling
-    "repeat_penalty": 1.1,  # Prevent repetition
-    "top_k": 40,  # Top-k sampling for better code quality
-    "num_ctx": 4096,  # Context window size
-}
+DEFAULT_GPU_CONFIG = detect_gpu()
 
 # Default model configuration - Now using CodeLlama:7b-instruct
 DEFAULT_MODEL = "codellama:7b-instruct"
@@ -45,7 +80,7 @@ DEFAULT_MODEL = "codellama:7b-instruct"
 # Model-specific configurations for different tasks
 MODEL_CONFIGS = {
     "codellama:7b-instruct": {
-        "num_gpu": 1,
+        "num_gpu": DEFAULT_GPU_CONFIG["num_gpu"],  # Use detected GPU setting
         "num_thread": 8,
         "temperature": 0.3,  # Lower for code generation
         "top_p": 0.9,
@@ -54,14 +89,14 @@ MODEL_CONFIGS = {
         "num_ctx": 4096,
     },
     "mistral": {
-        "num_gpu": 1,
+        "num_gpu": DEFAULT_GPU_CONFIG["num_gpu"],  # Use detected GPU setting
         "num_thread": 8,
         "temperature": 0.7,  # Higher for general tasks
         "top_p": 0.9,
         "repeat_penalty": 1.1,
     },
     "llama2": {
-        "num_gpu": 1,
+        "num_gpu": DEFAULT_GPU_CONFIG["num_gpu"],  # Use detected GPU setting
         "num_thread": 8,
         "temperature": 0.5,
         "top_p": 0.9,
@@ -93,6 +128,12 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 GENERATED_DIR = BASE_DIR / "generated"  # Where all generated files go
 GENERATED_DIR.mkdir(exist_ok=True)  # Create directory if it doesn't exist
+
+# =============================================================================
+# DATABASE INTEGRATION - SAFE ADDITION
+# =============================================================================
+# Initialize database integration (non-disruptive)
+db_integration = SafeDatabaseIntegration()
 
 # =============================================================================
 # ENUMS AND DATA MODELS
@@ -447,27 +488,31 @@ class CoderAgent(BaseAgent):
         try:
             print(f"🔧 CoderAgent received task: {message.content}")
             
-            # Simplified prompt - let the LLM handle formatting
+            # Enhanced prompt for clean code generation
             prompt = f"""
-You are an expert Python developer. Write clean, working Python code.
+You are an expert Python developer. Generate ONLY clean, working Python code.
 
 Task: {message.content}
 
-Requirements:
-- Write complete, runnable Python code
-- Include proper error handling
+CRITICAL REQUIREMENTS:
+- Generate ONLY the Python code, NO explanations, NO comments, NO markdown
+- Write complete, runnable Python functions
+- Include proper error handling with try/except
 - Add type hints and docstrings
 - Follow PEP 8 style guidelines
-- Generate ONLY the Python code, no explanations
+- DO NOT include any explanatory text or comments outside the code
+- DO NOT use markdown formatting or code blocks
+- DO NOT add "Here's the code:" or similar text
 
-Example format:
-def example_function(param: int) -> str:
-    \"\"\"Brief description of function.\"\"\"
+Example of what to generate:
+def sum_numbers(a: int, b: int) -> int:
+    \"\"\"Add two numbers and return the result.\"\"\"
     try:
-        # Implementation here
-        return str(param)
-    except Exception as e:
-        raise ValueError(f"Error: {{e}}")
+        return a + b
+    except TypeError as e:
+        raise ValueError(f"Both arguments must be integers: {{e}}")
+
+Generate ONLY the function code, nothing else.
 """
             
             response = self.llm.invoke(prompt)
@@ -503,23 +548,41 @@ def example_function(param: int) -> str:
             return [self.create_error_message(message.from_agent, f"Code generation failed: {str(e)}")]
     
     def _simple_code_extraction(self, response: str) -> str:
-        """Simple, robust code extraction"""
+        """Enhanced code extraction that removes all comments and explanations"""
         # Remove markdown code blocks
         code = re.sub(r'```python\n', '', response)
         code = re.sub(r'```\n', '', code)
         code = re.sub(r'```', '', code)
         
-        # Remove common prefixes
+        # Remove common prefixes and explanations
         lines = code.split('\n')
         cleaned_lines = []
+        in_code = False
         
         for line in lines:
-            # Skip markdown headers and explanations
-            if line.strip().startswith('#') and len(line.strip().split()) > 3:
+            stripped = line.strip()
+            
+            # Skip empty lines at the beginning
+            if not in_code and not stripped:
                 continue
-            cleaned_lines.append(line)
+                
+            # Start collecting code when we see function definitions or imports
+            if (stripped.startswith(('def ', 'import ', 'from ')) or
+                (stripped.startswith('class ') and ':' in stripped) or
+                (in_code and stripped)):
+                in_code = True
+                cleaned_lines.append(line)
+            elif in_code:
+                # Keep all lines once we're in code mode
+                cleaned_lines.append(line)
         
-        return '\n'.join(cleaned_lines).strip()
+        # Remove any remaining explanatory text
+        result = '\n'.join(cleaned_lines).strip()
+        
+        # Remove any remaining markdown or explanatory text
+        result = re.sub(r'^.*?(def |import |from |class )', r'\1', result, flags=re.DOTALL)
+        
+        return result
     
     def _fix_indentation(self, code: str) -> str:
         """
@@ -722,10 +785,12 @@ class TesterAgent(BaseAgent):
             6. Make sure tests are complete and runnable
             7. Test both valid inputs and invalid inputs
             8. Test edge cases like zero, negative numbers, large numbers
-            9. DO NOT include the original code in the test file - the runner will import it
+            9. DO NOT include the original code in the test file
             10. Only generate the test code, not the original code
-            11. DO NOT use import statements for the functions - they will be available directly
+            11. DO NOT use ANY import statements - the functions will be available directly
             12. Write tests as if the functions are already defined in the same scope
+            13. IMPORTANT: Do not use 'from your_module import' or any import statements
+            14. The functions will be executed in the same file as the tests
             
             Generate only the test code, no explanations or markdown formatting.
             """
@@ -840,6 +905,15 @@ class TesterAgent(BaseAgent):
         
         for line in lines:
             if line.strip():
+                # Remove any import statements that reference the functions
+                if any(import_statement in line.lower() for import_statement in [
+                    'from your_module import',
+                    'import your_module',
+                    'from module import',
+                    'import module'
+                ]):
+                    continue  # Skip this line
+                
                 # Fix indentation - use 4 spaces consistently
                 leading_spaces = len(line) - len(line.lstrip())
                 correct_spaces = (leading_spaces // 4) * 4
@@ -947,29 +1021,16 @@ class RunnerAgent(BaseAgent):
         try:
             print(f"🔧 Running tests with {len(code)} chars of code and {len(test_code)} chars of tests")
             
-            # Create a temporary file for the code
+            # Create a temporary file that combines both code and tests
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                # First execute the code to define the functions
                 f.write(code)
-                code_file = f.name
-            
-            # Create a temporary file for the tests that imports the code
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-                # Create test file that imports the code
-                test_content = f"""
-import sys
-import os
-sys.path.insert(0, r'{os.path.dirname(code_file)}')
-
-# Import the code to test
-exec(open(r'{code_file}').read())
-
-{test_code}
-"""
-                f.write(test_content)
+                f.write("\n\n")
+                # Then add the tests
+                f.write(test_code)
                 test_file = f.name
             
-            print(f"📁 Created code file: {code_file}")
-            print(f"📁 Created test file: {test_file}")
+            print(f"📁 Created combined file: {test_file}")
             
             # Run the tests using subprocess
             result = subprocess.run(
@@ -984,7 +1045,6 @@ exec(open(r'{code_file}').read())
             print(f"📤 stderr: {len(result.stderr)} chars")
             
             # Clean up temporary files
-            os.unlink(code_file)
             os.unlink(test_file)
             
             # Return the test results
@@ -1070,6 +1130,10 @@ class MessageBus:
         """
         print(f"🔀 Sending message: {message.from_agent} -> {message.to_agent} ({message.message_type.value})")
         print(f"   Content: {message.content[:100]}...")
+        
+        # NEW: Log message to database (NON-BLOCKING)
+        if hasattr(self, 'logger'):
+            asyncio.create_task(self.logger.log_message(message))
         
         target_agent = self.agents.get(message.to_agent)
         if not target_agent:
@@ -1167,6 +1231,7 @@ class PromptRequest(BaseModel):
     prompt: str
     code_history: List[str] = []
     error_history: List[str] = []
+    conversation_id: Optional[str] = None
 
 class WorkflowRequest(BaseModel):
     """
@@ -1234,6 +1299,13 @@ async def chat(request: PromptRequest):
         
         # Create a message bus for this session
         message_bus = MessageBus()
+        
+        # NEW: Attach database logger to message bus (NON-DISRUPTIVE)
+        # Pass conversation_id if provided
+        if request.conversation_id:
+            db_integration.attach_to_message_bus(message_bus, conversation_id=request.conversation_id)
+        else:
+            db_integration.attach_to_message_bus(message_bus)
         
         # Define the default workflow agents
         workflow_agents = [
@@ -1779,11 +1851,91 @@ async def switch_default_model(model_name: str):
         }
 
 # =============================================================================
+# DATABASE API ENDPOINTS - NEW ADDITIONS
+# =============================================================================
+
+@app.post("/conversations")
+async def create_conversation(request: ConversationRequest):
+    """Create new conversation - doesn't affect current agents"""
+    try:
+        conversation_id = await db_integration.start_conversation(request.title)
+        return {"conversation_id": conversation_id, "title": request.title}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
+
+@app.get("/conversations")
+async def get_conversations():
+    """Get conversation history - read-only"""
+    try:
+        conversations = await db_integration.get_conversations()
+        return [
+            ConversationResponse(
+                id=conv['id'],
+                title=conv['title'],
+                created_at=conv['created_at'],
+                updated_at=conv['updated_at'],
+                message_count=conv['message_count']
+            )
+            for conv in conversations
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get conversations: {str(e)}")
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """Get specific conversation - read-only"""
+    try:
+        conversation = await db_integration.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        messages = db_integration.db_service.get_conversation_messages(conversation_id)
+        return {
+            "conversation": {
+                "id": conversation.id,
+                "title": conversation.title,
+                "created_at": conversation.created_at,
+                "updated_at": conversation.updated_at,
+                "is_active": conversation.is_active
+            },
+            "messages": [
+                {
+                    "id": msg.id,
+                    "from_agent": msg.from_agent,
+                    "to_agent": msg.to_agent,
+                    "message_type": msg.message_type,
+                    "content": msg.content,
+                    "timestamp": msg.timestamp,
+                    "metadata": msg.message_metadata
+                }
+                for msg in messages
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get conversation: {str(e)}")
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Delete conversation - doesn't affect current agents"""
+    try:
+        success = await db_integration.delete_conversation(conversation_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        return {"message": "Conversation deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete conversation: {str(e)}")
+
+# =============================================================================
 # STARTUP MESSAGE - SHOWS WHEN SERVER STARTS
 # =============================================================================
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Starting Multi-Agent AI System...")
+    print(f"🔧 GPU Configuration: {DEFAULT_GPU_CONFIG}")
     print("📁 Generated files will be saved to:", GENERATED_DIR)
     print("🌐 Server will be available at: http://localhost:8000")
     print("📚 API Documentation: http://localhost:8000/docs")
