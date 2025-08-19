@@ -41,7 +41,11 @@ from database import SafeDatabaseIntegration, ConversationRequest, ConversationR
 # CONFIGURATION
 # =============================================================================
 
-# API Keys - Set these in environment variables
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+# API Keys - Set these in environment variables or .env file
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
