@@ -42,9 +42,9 @@ from database import SafeDatabaseIntegration, ConversationRequest, ConversationR
 # =============================================================================
 
 # API Keys - Set these in environment variables
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "deNpjI2ZANiSN6ZmWUwONZQf8FWh8BUB")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyAEfhANJ5nBYacg4LGeHuVEiGj1jz-6ttU")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Model configurations
 ONLINE_MODEL_CONFIGS = {
