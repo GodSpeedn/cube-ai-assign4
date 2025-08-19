@@ -19,10 +19,12 @@ import ast # Added for syntax validation
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from langchain_ollama import OllamaLLM
+import uvicorn
 
 # Database integration
 from database import SafeDatabaseIntegration, ConversationRequest, ConversationResponse, ChatRequestWithConversation
@@ -35,7 +37,6 @@ from database import SafeDatabaseIntegration, ConversationRequest, ConversationR
 def detect_gpu():
     """Detect if GPU is available and configure accordingly"""
     try:
-        import subprocess
         result = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
         if result.returncode == 0:
             print("✅ GPU detected - using GPU acceleration")
@@ -118,6 +119,45 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static files for the API testing interface
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# =============================================================================
+# ROOT ENDPOINT - API STATUS PAGE
+# =============================================================================
+@app.get("/")
+async def root():
+    """Root endpoint - serves the API testing interface"""
+    return FileResponse("static/index.html")
+
+@app.get("/api-docs")
+async def api_docs():
+    """Redirect to FastAPI's built-in documentation"""
+    return RedirectResponse(url="/docs")
+
+@app.get("/api-status")
+async def api_status():
+    """API status endpoint - shows API status and available endpoints"""
+    return {
+        "message": "Multi-Agent AI System API",
+        "status": "running",
+        "version": "2.0.0",
+        "endpoints": {
+            "health": "/health",
+            "chat": "/chat",
+            "conversations": "/conversations",
+            "files": "/list-files",
+            "workflow": "/run-workflow",
+            "manual_flow": "/run-manual-flow",
+            "agents": "/agents",
+            "models": "/models",
+            "gpu_status": "/gpu-status"
+        },
+        "documentation": "/docs",
+        "frontend": "http://localhost:5173",
+        "api_testing_interface": "/"
+    }
 
 # =============================================================================
 # PATHS & DIRECTORIES - YOU CAN CHANGE THESE PATHS
@@ -433,7 +473,6 @@ class CoordinatorAgent(BaseAgent):
             
             # Try to parse the response as JSON
             try:
-                import json
                 plan = json.loads(response)
                 steps = plan.get("steps", [])
             except:
@@ -1737,9 +1776,6 @@ async def get_gpu_status():
     Can I change: YES - you can add more GPU diagnostics
     """
     try:
-        import subprocess
-        import json
-        
         # Check if CUDA is available
         cuda_available = False
         try:
@@ -1930,13 +1966,73 @@ async def delete_conversation(conversation_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete conversation: {str(e)}")
 
 # =============================================================================
+# ONLINE AGENT SERVICE INTEGRATION
+# =============================================================================
+# Import the online agent service components
+from online_agent_service import (
+    online_app as online_agent_app,
+    workflow_manager as online_workflow_manager,
+    OnlineWorkflowRequest,
+    OnlineAgent,
+    ONLINE_MODEL_CONFIGS
+)
+
+# Mount the online agent service under /online path
+app.mount("/online", online_agent_app, name="online_agent_service")
+
+# Add a combined health check endpoint
+@app.get("/combined-health")
+async def combined_health_check():
+    """Health check for both main service and online agent service"""
+    return {
+        "main_service": {
+            "status": "healthy",
+            "port": 8000,
+            "endpoints": ["/chat", "/run-workflow", "/conversations"]
+        },
+        "online_agent_service": {
+            "status": "healthy", 
+            "port": 8000,
+            "path": "/online",
+            "endpoints": ["/online/health", "/online/run-workflow", "/online/models"],
+            "available_models": list(ONLINE_MODEL_CONFIGS.keys())
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
+# Add endpoint to get online models from main service
+@app.get("/online-models")
+async def get_online_models_from_main():
+    """Get online models through main service"""
+    return {
+        "available_models": ONLINE_MODEL_CONFIGS,
+        "default_model": "gpt-3.5-turbo",
+        "providers": {
+            "openai": ["gpt-4", "gpt-3.5-turbo", "gpt-4-turbo"],
+            "mistral": ["mistral-large", "mistral-medium", "mistral-small"]
+        }
+    }
+
+# Add endpoint to run online workflow through main service
+@app.post("/run-online-workflow")
+async def run_online_workflow_from_main(request: OnlineWorkflowRequest):
+    """Run online agent workflow through main service"""
+    try:
+        response = await online_workflow_manager.run_workflow(request)
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Online workflow failed: {str(e)}")
+
+# =============================================================================
 # STARTUP MESSAGE - SHOWS WHEN SERVER STARTS
 # =============================================================================
 if __name__ == "__main__":
-    import uvicorn
     print("🚀 Starting Multi-Agent AI System...")
     print(f"🔧 GPU Configuration: {DEFAULT_GPU_CONFIG}")
     print("📁 Generated files will be saved to:", GENERATED_DIR)
-    print("🌐 Server will be available at: http://localhost:8000")
+    print("🌐 Main Server will be available at: http://localhost:8000")
+    print("🌐 Online Agent Service will be available at: http://localhost:8000/online")
     print("📚 API Documentation: http://localhost:8000/docs")
+    print("📚 Online Service Documentation: http://localhost:8000/online/docs")
+    print("🔗 Combined Health Check: http://localhost:8000/combined-health")
     uvicorn.run(app, host="0.0.0.0", port=8000)

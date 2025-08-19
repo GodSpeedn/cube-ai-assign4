@@ -360,4 +360,143 @@ export async function deleteConversation(conversationId: string): Promise<void> 
     console.error('Delete conversation error:', error);
     throw error;
   }
+}
+
+// =============================================================================
+// ONLINE AGENT SERVICE API FUNCTIONS
+// =============================================================================
+
+const ONLINE_API_BASE_URL = 'http://localhost:8000/online';
+
+export interface OnlineAgent {
+  id: string;
+  name: string;
+  role: string;
+  model: string;
+  system_prompt: string;
+  memory_enabled: boolean;
+  conversation_id?: string;
+}
+
+export interface OnlineWorkflowRequest {
+  task: string;
+  agents: OnlineAgent[];
+  conversation_id?: string;
+  enable_streaming: boolean;
+}
+
+export interface OnlineWorkflowResponse {
+  workflow_id: string;
+  status: string;
+  agents: Record<string, string>;
+  message_history: any[];
+  total_messages: number;
+  conversation_id: string;
+}
+
+/**
+ * Test online agent service connection
+ */
+export async function testOnlineServiceConnection(): Promise<boolean> {
+  try {
+    const response = await fetch(`${ONLINE_API_BASE_URL}/health`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+      }
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      console.log('Online service connection test passed:', data);
+      return true;
+    } else {
+      console.error('Online service connection test failed:', response.status);
+      return false;
+    }
+  } catch (error) {
+    console.error('Online service connection test error:', error);
+    return false;
+  }
+}
+
+/**
+ * Get available online models
+ */
+export async function getOnlineModels(): Promise<any> {
+  try {
+    const response = await fetch(`${ONLINE_API_BASE_URL}/models`);
+    if (!response.ok) throw new Error('Failed to get online models');
+    return await response.json();
+  } catch (error) {
+    console.error('Get online models error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Run online agent workflow
+ */
+export async function runOnlineWorkflow(request: OnlineWorkflowRequest): Promise<OnlineWorkflowResponse> {
+  try {
+    const response = await fetch(`${ONLINE_API_BASE_URL}/run-workflow`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Online workflow failed: ${response.status} - ${errorText}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error('Online workflow API error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Get online workflow status
+ */
+export async function getOnlineWorkflowStatus(workflowId: string): Promise<any> {
+  try {
+    const response = await fetch(`${ONLINE_API_BASE_URL}/workflow-status/${workflowId}`);
+    if (!response.ok) throw new Error('Failed to get workflow status');
+    return await response.json();
+  } catch (error) {
+    console.error('Get workflow status error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Get online conversations
+ */
+export async function getOnlineConversations(): Promise<Conversation[]> {
+  try {
+    const response = await fetch(`${ONLINE_API_BASE_URL}/conversations`);
+    if (!response.ok) throw new Error('Failed to fetch online conversations');
+    return await response.json();
+  } catch (error) {
+    console.error('Get online conversations error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Get online conversation details
+ */
+export async function getOnlineConversation(conversationId: string): Promise<ConversationDetail> {
+  try {
+    const response = await fetch(`${ONLINE_API_BASE_URL}/conversations/${conversationId}`);
+    if (!response.ok) throw new Error('Failed to get online conversation');
+    return await response.json();
+  } catch (error) {
+    console.error('Get online conversation error:', error);
+    throw error;
+  }
 } 

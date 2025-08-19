@@ -293,6 +293,22 @@ class SafeDatabaseIntegration:
             return self.db_service.get_conversation(conversation_id)
         return None
     
+    async def add_message_to_conversation(self, conversation_id: str, from_agent: str, 
+                                        to_agent: str, message_type: str, content: str, 
+                                        metadata: Dict[str, Any] = None):
+        """Add message to conversation"""
+        if self.enabled:
+            message_data = {
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+                "message_type": message_type,
+                "content": content,
+                "metadata": metadata or {},
+                "timestamp": datetime.utcnow()
+            }
+            return self.db_service.save_message(conversation_id, message_data)
+        return None
+    
     async def delete_conversation(self, conversation_id: str):
         """Delete conversation - doesn't affect current agents"""
         if self.enabled:

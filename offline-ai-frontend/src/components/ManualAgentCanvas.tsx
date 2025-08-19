@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { runManualFlow } from '../services/api';
+import { runManualFlow, testOnlineServiceConnection, getOnlineModels, runOnlineWorkflow, OnlineAgent, OnlineWorkflowRequest } from '../services/api';
 
 export type AgentType = 'coordinator' | 'coder' | 'tester' | 'runner' | 'custom';
 
@@ -24,6 +24,7 @@ interface ManualAgentBox {
   height: number;
   agentType: AgentType;
   role: string;
+  roleDescription: string;
   model?: string;
 }
 
@@ -47,21 +48,16 @@ const agentTypeOptions = [
   { value: 'custom', label: 'Custom' },
 ];
 
-const modelOptions = [
+const offlineModelOptions = [
   { value: 'mistral', label: 'Mistral' },
   { value: 'phi', label: 'Phi' },
   { value: 'llama3.2:3b', label: 'Llama3.2:3b' },
   { value: 'custom', label: 'Custom' },
 ];
 
-const roleOptions = [
-  { value: 'coordinator', label: 'Coordinator' },
-  { value: 'coder', label: 'Coder' },
-  { value: 'tester', label: 'Tester' },
-  { value: 'runner', label: 'Runner' },
-  { value: 'custom', label: 'Custom' },
-  { value: 'other', label: 'Other...' },
-];
+
+
+
 
 const DEFAULT_BOX = { width: 300, height: 100 };
 
@@ -91,7 +87,7 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
   const canvasRef = useRef<HTMLDivElement>(null);
   // Store popup position and size per connection
   const [popupStates, setPopupStates] = useState<Record<string, { x?: number; y?: number; width?: number; height?: number }>>({});
-  const DEFAULT_POPUP = { width: 300, height: 180 };
+  const DEFAULT_POPUP = { width: 400, height: 300 };
   const [resizingPopup, setResizingPopup] = useState<{ id: string; startX: number; startY: number; startW: number; startH: number } | null>(null);
   const [draggingPopup, setDraggingPopup] = useState<{ id: string; offsetX: number; offsetY: number }>();
 
@@ -100,16 +96,65 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
 
   // Agent messages and workflow state
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
+  const [isOnlineMode, setIsOnlineMode] = useState(false);
+  const [onlineServiceConnected, setOnlineServiceConnected] = useState(false);
+  const [geminiAvailable, setGeminiAvailable] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
-  const [customRoleFocusBoxId, setCustomRoleFocusBoxId] = useState<string | null>(null);
-  const customRoleInputRef = useRef<HTMLInputElement>(null);
 
-  // Focus custom role input when needed
+  // Canvas zoom and pan state
+  const [canvasScale, setCanvasScale] = useState(1);
+  const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+
+  // Online/Offline mode state
+  const [onlineModels, setOnlineModels] = useState<any>(null);
+
+
+  // Define online model options with Gemini availability status
+  const onlineModelOptions = [
+    { 
+      value: 'gemini-pro', 
+      label: geminiAvailable ? 'Gemini Pro (Google) - Recommended ✨' : 'Gemini Pro (Google) - Not Available' 
+    },
+    { 
+      value: 'gemini-pro-vision', 
+      label: geminiAvailable ? 'Gemini Pro Vision (Google) ✨' : 'Gemini Pro Vision (Google) - Not Available' 
+    },
+    { value: 'mistral-small', label: 'Mistral Small' },
+    { value: 'mistral-medium', label: 'Mistral Medium' },
+    { value: 'mistral-large', label: 'Mistral Large' },
+    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo (OpenAI) - Quota Limited' },
+    { value: 'gpt-4', label: 'GPT-4 (OpenAI) - Quota Limited' },
+    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo (OpenAI) - Quota Limited' }
+  ];
+
+  // Check online service connection and model availability
   useEffect(() => {
-    if (customRoleFocusBoxId && customRoleInputRef.current) {
-      customRoleInputRef.current.focus();
+    if (isOnlineMode) {
+      testOnlineServiceConnection().then(connected => {
+        setOnlineServiceConnected(connected);
+        if (connected) {
+          getOnlineModels().then(models => {
+            setOnlineModels(models);
+            // Check if Gemini models are available
+            const hasGemini = models.available_models && (
+              'gemini-pro' in models.available_models || 
+              'gemini-pro-vision' in models.available_models
+            );
+            setGeminiAvailable(hasGemini);
+          }).catch(err => {
+            console.error('Failed to get online models:', err);
+            setGeminiAvailable(false);
+          });
+        }
+      }).catch(err => {
+        console.error('Failed to test online service connection:', err);
+        setOnlineServiceConnected(false);
+        setGeminiAvailable(false);
+      });
     }
-  }, [customRoleFocusBoxId]);
+  }, [isOnlineMode]);
 
   // Placeholder for running the flow
   const [prompt, setPrompt] = useState('');
@@ -128,8 +173,54 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
     setAgentMessages([]);
 
     try {
-      const data = await runManualFlow(prompt.trim(), boxes, connections);
-      setAgentMessages(data.messages || []);
+      let data;
+      
+      if (isOnlineMode) {
+        // Convert boxes to online agent format
+        const onlineAgents: OnlineAgent[] = boxes.map(box => ({
+          id: box.id,
+          name: box.role || box.agentType,
+          role: box.role || box.agentType,
+          model: box.model || 'mistral-small', // Use Mistral as default since OpenAI quota exceeded
+          system_prompt: box.roleDescription || `You are a ${box.role || box.agentType} agent. Perform your role effectively.`,
+          memory_enabled: true
+        }));
+
+        const onlineRequest: OnlineWorkflowRequest = {
+          task: prompt.trim(),
+          agents: onlineAgents,
+          enable_streaming: true,
+          conversation_id: undefined // Don't create a database conversation for manual flow
+        };
+
+        data = await runOnlineWorkflow(onlineRequest);
+        console.log('Online workflow response:', data);
+        // Convert online message format to frontend format
+        const convertedMessages = (data.message_history || []).map((msg: any) => ({
+          id: msg.id,
+          agentId: msg.from_agent, // Use from_agent as agentId for display
+          agentType: msg.from_agent,
+          agentName: msg.from_agent,
+          content: msg.content,
+          timestamp: msg.timestamp,
+          fromAgent: msg.from_agent,
+          toAgent: msg.to_agent
+        }));
+        console.log('Converted messages:', convertedMessages);
+        setAgentMessages(convertedMessages);
+      } else {
+        // Use offline mode
+        // Convert boxes to include roleDescription for offline mode
+        const offlineBoxes = boxes.map(box => ({
+          ...box,
+          agentType: box.role || box.agentType, // Use role as agentType
+          role: box.role || box.agentType,
+          description: box.roleDescription || `You are a ${box.role || box.agentType} agent.`
+        }));
+        data = await runManualFlow(prompt.trim(), offlineBoxes, connections);
+        console.log('Offline workflow response:', data);
+        setAgentMessages(data.messages || []);
+      }
 
       if (data.generated_files && data.generated_files.length > 0) {
         console.log('Generated files:', data.generated_files);
@@ -155,6 +246,7 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
         height: DEFAULT_BOX.height,
         agentType: 'coordinator',
         role: '',
+        roleDescription: '',
       },
     ]);
   };
@@ -196,8 +288,38 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
     setConnectDrag({ fromId: boxId, fromSide: side, mouse: { x: handleX, y: handleY } });
   };
 
-  // Mouse move for drag/resize/connect
+  // Mouse move for drag/resize/connect/popup
   const handleCanvasMouseMove = (e: React.MouseEvent) => {
+    // Handle popup operations first
+    if (draggingPopup) {
+      setPopupStates(prev => ({
+        ...prev,
+        [draggingPopup.id]: {
+          ...prev[draggingPopup.id],
+          x: e.clientX - draggingPopup.offsetX,
+          y: e.clientY - draggingPopup.offsetY,
+          width: prev[draggingPopup.id]?.width || DEFAULT_POPUP.width,
+          height: prev[draggingPopup.id]?.height || DEFAULT_POPUP.height,
+        },
+      }));
+      return;
+    }
+    
+    if (resizingPopup) {
+      const dx = e.clientX - resizingPopup.startX;
+      const dy = e.clientY - resizingPopup.startY;
+      setPopupStates(prev => ({
+        ...prev,
+        [resizingPopup.id]: {
+          ...prev[resizingPopup.id],
+          width: Math.max(220, resizingPopup.startW + dx),
+          height: Math.max(80, resizingPopup.startH + dy),
+        },
+      }));
+      return;
+    }
+    
+    // Handle box operations
     if (resizeId) {
       const dx = e.clientX - resizeStart.x;
       const dy = e.clientY - resizeStart.y;
@@ -287,9 +409,9 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
           onMouseDown={e => handlePopupDragMouseDown(e, conn.id)}
         >
           <div style={{ fontWeight: 600, marginBottom: 8, textAlign: 'center', borderBottom: `1px solid ${isDark ? '#444' : '#ddd'}`, paddingBottom: 8 }}>
-            📡 Agent Communication
+            💬 Agent Conversation
             <div style={{ fontSize: 11, fontWeight: 400, color: isDark ? '#888' : '#666', marginTop: 2 }}>
-              {from.agentType} ↔ {to.agentType}
+              {from.role || from.agentType} ↔ {to.role || to.agentType}
             </div>
           </div>
           
@@ -300,8 +422,9 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
             marginBottom: 12,
             border: `1px solid ${isDark ? '#444' : '#ddd'}`,
             borderRadius: 6,
-            padding: 8,
-            fontSize: 12
+            padding: 12,
+            fontSize: 13,
+            maxHeight: 200
           }}>
             {connectionMessages.length === 0 ? (
               <div style={{ textAlign: 'center', color: isDark ? '#888' : '#666', fontStyle: 'italic', padding: '20px 0' }}>
@@ -336,9 +459,16 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
                       justifyContent: 'space-between',
                       alignItems: 'center'
                     }}>
-                      <span>{message.agentName}</span>
-                      {isCommand && <span style={{ fontSize: 9, background: '#3b82f6', color: 'white', padding: '1px 4px', borderRadius: 2 }}>CMD</span>}
-                      {isResponse && <span style={{ fontSize: 9, background: '#10b981', color: 'white', padding: '1px 4px', borderRadius: 2 }}>RESP</span>}
+                      <span>
+                        {message.agentId === from.id ? '←' : '→'} {message.agentName}
+                      </span>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        {isCommand && <span style={{ fontSize: 9, background: '#3b82f6', color: 'white', padding: '1px 4px', borderRadius: 2 }}>CMD</span>}
+                        {isResponse && <span style={{ fontSize: 9, background: '#10b981', color: 'white', padding: '1px 4px', borderRadius: 2 }}>RESP</span>}
+                        <span style={{ fontSize: 9, color: isDark ? '#888' : '#666' }}>
+                          {new Date(message.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
                     </div>
                     <div style={{ 
                       fontSize: 11, 
@@ -441,7 +571,19 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
 
   // Render connections as SVG paths
   const renderConnections = () => (
-    <svg style={{ position: 'absolute', width: '100%', height: '100%', zIndex: 1, pointerEvents: 'auto' }}>
+    <svg 
+      style={{ 
+        position: 'absolute', 
+        width: '100%', 
+        height: '100%', 
+        zIndex: 1, 
+        pointerEvents: 'auto',
+        top: 0,
+        left: 0
+      }}
+      viewBox="0 0 100% 100%"
+      preserveAspectRatio="none"
+    >
       {connections.map(conn => {
         const from = boxes.find(b => b.id === conn.fromId);
         const to = boxes.find(b => b.id === conn.toId);
@@ -481,7 +623,6 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
             strokeWidth={2}
             fill="none"
             strokeDasharray="6 4"
-            markerEnd="url(#arrowhead)"
           />
         );
       })()}
@@ -534,17 +675,15 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
 
   // Get messages for a specific agent box
   const getBoxMessages = (boxId: string): AgentMessage[] => {
-    return agentMessages.filter(message => message.agentId === boxId)
+    const messages = agentMessages.filter(message => message.agentId === boxId)
       .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    console.log(`Messages for box ${boxId}:`, messages);
+    return messages;
   };
 
   // Render agent boxes
   const renderBoxes = () => (
     boxes.map(box => {
-      // Role field logic
-      const isStandardRole = roleOptions.some(opt => opt.value === box.role);
-      const showDropdown = !box.role || isStandardRole;
-      const showInput = !showDropdown;
       const boxMessages = getBoxMessages(box.id);
       const hasMessages = boxMessages.length > 0;
       const isActive = isRunning && hasMessages;
@@ -575,91 +714,86 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
           onMouseLeave={() => setHoveredBoxId(null)}
         >
           {renderHandles(box)}
-          {/* All controls in a single row */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, width: '100%' }}>
+          
+          {/* Pin and Delete buttons */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
             <button
-              style={{ background: 'none', border: 'none', color: isDark ? '#f97316' : '#f97316', fontSize: 18, cursor: 'pointer', zIndex: 10, padding: 0, marginRight: 2 }}
+              style={{ background: 'none', border: 'none', color: isDark ? '#f97316' : '#f97316', fontSize: 18, cursor: 'pointer', zIndex: 10, padding: 0 }}
               title={pinnedBoxes[box.id] ? 'Unpin' : 'Pin'}
               onClick={e => { e.stopPropagation(); setPinnedBoxes(prev => ({ ...prev, [box.id]: !prev[box.id] })); }}
             >
               {pinnedBoxes[box.id] ? '📌' : '📍'}
             </button>
+            
+            <button
+              style={{ background: 'none', border: 'none', color: '#ef4444', fontSize: 16, cursor: 'pointer', zIndex: 10, padding: 0 }}
+              title="Delete Box"
+              onClick={e => { 
+                e.stopPropagation(); 
+                setBoxes(prev => prev.filter(b => b.id !== box.id));
+                // Also remove any connections involving this box
+                setConnections(prev => prev.filter(c => c.fromId !== box.id && c.toId !== box.id));
+              }}
+            >
+              🗑️
+            </button>
+          </div>
+          
+          {/* Role Dropdown */}
+          <div style={{ marginBottom: 8 }}>
             <select
-              value={box.agentType || ''}
-              onChange={e => handleBoxChange(box.id, 'agentType', e.target.value as AgentType)}
+              value={box.role || ''}
+              onChange={e => handleBoxChange(box.id, 'role', e.target.value)}
               style={{
                 background: isDark ? '#181A20' : '#f9f9f9',
                 color: isDark ? '#fff' : '#222',
                 border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
                 borderRadius: 6,
                 padding: '6px 10px',
-                fontSize: 15,
+                fontSize: 14,
                 outline: 'none',
-                minWidth: 110,
+                width: '100%',
                 transition: 'border 0.15s',
               }}
             >
-              <option value="">Select Agent</option>
+              <option value="">Select Role</option>
               <option value="coordinator">Coordinator</option>
               <option value="coder">Coder</option>
               <option value="tester">Tester</option>
               <option value="runner">Runner</option>
+              <option value="reviewer">Reviewer</option>
+              <option value="analyst">Analyst</option>
               <option value="custom">Custom</option>
             </select>
-            {showDropdown && (
-              <select
-                value={isStandardRole ? box.role : 'other'}
-                onChange={e => {
-                  if (e.target.value === 'other') {
-                    handleBoxChange(box.id, 'role', '');
-                    setCustomRoleFocusBoxId(box.id);
-                  } else {
-                    handleBoxChange(box.id, 'role', e.target.value);
-                    setCustomRoleFocusBoxId(null);
-                  }
-                }}
-                style={{
-                  background: isDark ? '#181A20' : '#f9f9f9',
-                  color: isDark ? '#fff' : '#222',
-                  border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
-                  borderRadius: 6,
-                  padding: '6px 10px',
-                  fontSize: 15,
-                  outline: 'none',
-                  minWidth: 90,
-                  transition: 'border 0.15s',
-                }}
-              >
-                {roleOptions.map(opt => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            )}
-            {showInput && (
-              <input
-                ref={customRoleFocusBoxId === box.id ? customRoleInputRef : undefined}
-                type="text"
-                placeholder="Custom role"
-                value={box.role}
-                onChange={e => handleBoxChange(box.id, 'role', e.target.value)}
-                style={{
-                  flex: 1,
-                  maxWidth: '60%',
-                  minWidth: 60,
-                  boxSizing: 'border-box',
-                  background: isDark ? '#181A20' : '#f9f9f9',
-                  color: isDark ? '#fff' : '#222',
-                  border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
-                  borderRadius: 6,
-                  padding: '6px 10px',
-                  fontSize: 15,
-                  outline: 'none',
-                  transition: 'border 0.15s',
-                }}
-              />
-            )}
+          </div>
+          
+          {/* Role Description Textarea */}
+          <div style={{ marginBottom: 8 }}>
+            <textarea
+              placeholder="Describe the agent's role and responsibilities..."
+              value={box.roleDescription}
+              onChange={e => handleBoxChange(box.id, 'roleDescription', e.target.value)}
+              style={{
+                background: isDark ? '#181A20' : '#f9f9f9',
+                color: isDark ? '#fff' : '#222',
+                border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
+                borderRadius: 6,
+                padding: '6px 10px',
+                fontSize: 12,
+                outline: 'none',
+                width: '100%',
+                height: 40,
+                resize: 'none',
+                transition: 'border 0.15s',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          
+          {/* Model Selection */}
+          <div style={{ marginBottom: 8 }}>
             <select
-              value={box.model || 'mistral'}
+              value={box.model || (isOnlineMode ? 'gemini-pro' : 'mistral')}
               onChange={e => handleBoxChange(box.id, 'model', e.target.value)}
               style={{
                 background: isDark ? '#181A20' : '#f9f9f9',
@@ -667,42 +801,58 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
                 border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
                 borderRadius: 6,
                 padding: '6px 10px',
-                fontSize: 15,
+                fontSize: 14,
                 outline: 'none',
-                minWidth: 90,
+                width: '100%',
                 transition: 'border 0.15s',
               }}
             >
-              {modelOptions.map(opt => (
+              {(isOnlineMode ? onlineModelOptions : offlineModelOptions).map(opt => (
                 <option key={opt.value} value={opt.value}>{opt.label}</option>
               ))}
             </select>
           </div>
           
-          {/* Messages display area */}
+          {/* Output Display Area */}
           {boxMessages.length > 0 && (
             <div style={{ 
               marginTop: 8, 
               padding: 8, 
               background: isDark ? '#1a1a1a' : '#f8f8f8',
               borderRadius: 6,
-              maxHeight: 60,
+              maxHeight: 80,
               overflow: 'auto',
               fontSize: 11,
               border: `1px solid ${isDark ? '#333' : '#ddd'}`
             }}>
-                             <div style={{ fontWeight: 600, marginBottom: 4, color: '#10b981' }}>
-                 {(() => {
-                   const lastMessage = boxMessages[boxMessages.length - 1];
-                   const content = lastMessage?.content || '';
-                   return `Latest: ${content.slice(0, 100)}${content.length > 100 ? '...' : ''}`;
-                 })()}
-               </div>
-              <div style={{ fontSize: 10, color: isDark ? '#888' : '#666' }}>
-                {boxMessages.length} message{boxMessages.length !== 1 ? 's' : ''}
+              <div style={{ fontWeight: 600, marginBottom: 4, color: '#10b981' }}>
+                Latest Output:
+              </div>
+              <div style={{ 
+                fontSize: 10, 
+                lineHeight: 1.3,
+                maxHeight: 60,
+                overflow: 'auto',
+                background: isDark ? '#00000020' : '#ffffff60',
+                padding: 4,
+                borderRadius: 4,
+                border: `1px solid ${isDark ? '#333' : '#e5e5e5'}`
+              }}>
+                {(() => {
+                  const lastMessage = boxMessages[boxMessages.length - 1];
+                  const content = lastMessage?.content || '';
+                  return content.length > 150 
+                    ? content.substring(0, 150) + '...'
+                    : content;
+                })()}
+              </div>
+              <div style={{ fontSize: 9, color: isDark ? '#888' : '#666', marginTop: 4 }}>
+                {boxMessages.length} message{boxMessages.length !== 1 ? 's' : ''} • {new Date(boxMessages[boxMessages.length - 1]?.timestamp || Date.now()).toLocaleTimeString()}
               </div>
             </div>
           )}
+          
+
           
           {/* Resize handle */}
           <div
@@ -728,8 +878,20 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
     })
   );
 
-  // Mouse up to stop drag/resize/connect
+  // Mouse up to stop drag/resize/connect/popup
   const handleCanvasMouseUp = (e: React.MouseEvent) => {
+    // Handle popup operations first
+    if (draggingPopup) {
+      setDraggingPopup(undefined);
+      return;
+    }
+    
+    if (resizingPopup) {
+      setResizingPopup(null);
+      return;
+    }
+    
+    // Handle connection operations
     if (connectDrag) {
       // Only connect if mouse is over a visible handle
       if (dragOverHandle && dragOverHandle.boxId !== connectDrag.fromId) {
@@ -748,6 +910,8 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
       setDragOverHandle(null);
       return;
     }
+    
+    // Handle box operations
     setDragId(null);
     setResizeId(null);
   };
@@ -846,8 +1010,8 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
     <div
       ref={canvasRef}
       style={{ width: '100%', height: '100%', position: 'relative', background: isDark ? '#181A20' : '#f4f4f4', cursor: 'default' }}
-      onMouseMove={handlePopupDragMouseMove}
-      onMouseUp={handlePopupDragMouseUp}
+      onMouseMove={handleCanvasMouseMove}
+      onMouseUp={handleCanvasMouseUp}
       onClick={handleCanvasClick}
     >
       {/* Top controls row */}
@@ -872,6 +1036,159 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
         >
           + Create an empty box
         </button>
+        
+        {/* Online/Offline Mode Toggle */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            background: isDark ? 'rgba(30,32,40,0.95)' : 'rgba(255,255,255,0.95)',
+            border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
+            borderRadius: 8,
+            padding: '6px 12px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+          }}
+        >
+          <span style={{ 
+            fontSize: 14, 
+            fontWeight: 500, 
+            color: isDark ? '#ccc' : '#666',
+            marginRight: 4
+          }}>
+            Mode:
+          </span>
+          <button
+            onClick={() => setIsOnlineMode(false)}
+            style={{
+              background: !isOnlineMode ? '#2563eb' : 'transparent',
+              color: !isOnlineMode ? '#fff' : (isDark ? '#ccc' : '#666'),
+              border: '1px solid',
+              borderColor: !isOnlineMode ? '#2563eb' : (isDark ? '#444' : '#bbb'),
+              borderRadius: 4,
+              padding: '4px 8px',
+              fontSize: 12,
+              fontWeight: 500,
+              cursor: 'pointer',
+              transition: 'all 0.2s',
+            }}
+          >
+            Offline
+          </button>
+          <button
+            onClick={() => setIsOnlineMode(true)}
+            style={{
+              background: isOnlineMode ? '#10b981' : 'transparent',
+              color: isOnlineMode ? '#fff' : (isDark ? '#ccc' : '#666'),
+              border: '1px solid',
+              borderColor: isOnlineMode ? '#10b981' : (isDark ? '#444' : '#bbb'),
+              borderRadius: 4,
+              padding: '4px 8px',
+              fontSize: 12,
+              fontWeight: 500,
+              cursor: 'pointer',
+              transition: 'all 0.2s',
+            }}
+          >
+            Online
+            {!onlineServiceConnected && (
+              <span style={{ 
+                marginLeft: 4, 
+                fontSize: 10, 
+                color: '#ef4444',
+                fontWeight: 'bold'
+              }}>
+                !
+              </span>
+            )}
+            {onlineServiceConnected && geminiAvailable && (
+              <span style={{ 
+                marginLeft: 4, 
+                fontSize: 10, 
+                color: '#10b981',
+                fontWeight: 'bold'
+              }}>
+                ✨
+              </span>
+            )}
+          </button>
+        </div>
+        
+        {/* Zoom and Pan Controls */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            background: isDark ? 'rgba(30,32,40,0.95)' : 'rgba(255,255,255,0.95)',
+            border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
+            borderRadius: 8,
+            padding: '6px 12px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+          }}
+        >
+          <button
+            onClick={() => setCanvasScale(prev => Math.max(0.5, prev - 0.1))}
+            style={{
+              background: 'transparent',
+              color: isDark ? '#ccc' : '#666',
+              border: '1px solid',
+              borderColor: isDark ? '#444' : '#bbb',
+              borderRadius: 4,
+              padding: '4px 8px',
+              fontSize: 14,
+              cursor: 'pointer',
+              transition: 'all 0.2s',
+            }}
+            title="Zoom Out"
+          >
+            🔍-
+          </button>
+          <span style={{ 
+            fontSize: 12, 
+            fontWeight: 500, 
+            color: isDark ? '#ccc' : '#666',
+            minWidth: 40,
+            textAlign: 'center'
+          }}>
+            {Math.round(canvasScale * 100)}%
+          </span>
+          <button
+            onClick={() => setCanvasScale(prev => Math.min(2, prev + 0.1))}
+            style={{
+              background: 'transparent',
+              color: isDark ? '#ccc' : '#666',
+              border: '1px solid',
+              borderColor: isDark ? '#444' : '#bbb',
+              borderRadius: 4,
+              padding: '4px 8px',
+              fontSize: 14,
+              cursor: 'pointer',
+              transition: 'all 0.2s',
+            }}
+            title="Zoom In"
+          >
+            🔍+
+          </button>
+          <button
+            onClick={() => { setCanvasScale(1); setCanvasOffset({ x: 0, y: 0 }); }}
+            style={{
+              background: 'transparent',
+              color: isDark ? '#ccc' : '#666',
+              border: '1px solid',
+              borderColor: isDark ? '#444' : '#bbb',
+              borderRadius: 4,
+              padding: '4px 8px',
+              fontSize: 12,
+              cursor: 'pointer',
+              transition: 'all 0.2s',
+            }}
+            title="Reset View"
+          >
+            🏠
+          </button>
+        </div>
+        
         <div
           style={{
             display: 'flex',
@@ -925,8 +1242,30 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
       </div>
       {/* Add top padding to canvas for agent boxes */}
       <div style={{ height: 70 }} />
-      {renderConnections()}
-      {renderBoxes()}
+      
+      {/* Canvas content with zoom and pan transformations */}
+      <div
+        style={{
+          position: 'relative',
+          width: '100%',
+          height: 'calc(100vh - 200px)',
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            transform: `scale(${canvasScale}) translate(${canvasOffset.x}px, ${canvasOffset.y}px)`,
+            transformOrigin: 'top left',
+            transition: 'transform 0.1s ease-out',
+            position: 'relative',
+            width: '100%',
+            height: '100%',
+          }}
+        >
+          {renderConnections()}
+          {renderBoxes()}
+        </div>
+      </div>
     </div>
   );
 };
