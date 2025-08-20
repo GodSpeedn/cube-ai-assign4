@@ -1,0 +1,8 @@
+# This is a placeholder for the cube-logo.png file
+# The user should replace this with the actual PNG logo file
+# 
+# To add your logo:
+# 1. Find your PNG logo file on your computer
+# 2. Copy it to this directory: offline-ai-frontend/public/
+# 3. Rename it to: cube-logo.png
+# 4. The logo will appear in the application header next to "Cube"
