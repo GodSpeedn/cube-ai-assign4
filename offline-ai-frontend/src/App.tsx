@@ -54,7 +54,14 @@ export default function App() {
     <div className={`h-screen w-screen ${isDark ? 'bg-gray-900' : 'bg-gray-100'} text-${isDark ? 'white' : 'gray-900'} flex flex-col overflow-hidden transition-colors duration-200`}>
       {/* Top Bar */}
       <div className={`p-4 flex justify-between items-center border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-        <h1 className="text-xl font-bold">Offline AI Coding Assistant</h1>
+        <div className="flex items-center space-x-2">
+          <img
+            src="/cube-logo.png"
+            alt="Cube Logo"
+            className="w-12 h-12"
+          />
+          <h1 className="text-xl font-bold">Cube</h1>
+        </div>
         <div className="flex space-x-4 items-center">
           <nav className="flex space-x-2">
             <button
