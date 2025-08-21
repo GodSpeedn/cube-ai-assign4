@@ -3,6 +3,7 @@ import AgentVisualization from '../components/AgentVisualization';
 import ConversationHistory, { ConversationHistoryRef } from '../components/ConversationHistory';
 import { testBackendConnection, createConversation, getConversation, chatWithAgents } from '../services/api';
 import { useTheme } from '../hooks/useTheme';
+import websocketService from '../services/websocket';
 
 interface AIBlock {
   id: string;
@@ -22,6 +23,11 @@ export default function AICommunicationPage() {
   const [isHistoryCollapsed, setIsHistoryCollapsed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  
+  // WebSocket state
+  const [wsConnected, setWsConnected] = useState(false);
+  const [wsStatus, setWsStatus] = useState('CLOSED');
+  const [realTimeMessages, setRealTimeMessages] = useState<AIBlock[]>([]);
   
   // Ref to ConversationHistory component for refreshing
   const conversationHistoryRef = useRef<ConversationHistoryRef>(null);
@@ -46,6 +52,101 @@ export default function AICommunicationPage() {
     const interval = setInterval(testConnection, 30000);
     return () => clearInterval(interval);
   }, []);
+
+  // WebSocket event handlers
+  useEffect(() => {
+    const handleConnected = () => {
+      setWsConnected(true);
+      setWsStatus('OPEN');
+      console.log('🔗 WebSocket connected to AICommunicationPage');
+    };
+
+    const handleDisconnected = () => {
+      setWsConnected(false);
+      setWsStatus('CLOSED');
+      console.log('🔌 WebSocket disconnected from AICommunicationPage');
+    };
+
+    const handleAgentMessage = (data: any) => {
+      console.log('📨 Received agent message via WebSocket:', data);
+      if (data.content && data.from_agent && data.to_agent) {
+        // Determine agent type based on name
+        let agentType: 'coordinator' | 'coder' | 'tester' | 'runner' = 'coordinator';
+        let agentName = data.from_agent;
+        
+        if (agentName.toLowerCase().includes('coder') || agentName.toLowerCase().includes('mistral')) {
+          agentType = 'coder';
+        } else if (agentName.toLowerCase().includes('tester') || agentName.toLowerCase().includes('phi')) {
+          agentType = 'tester';
+        } else if (agentName.toLowerCase().includes('runner') || agentName.toLowerCase().includes('llama')) {
+          agentType = 'runner';
+        } else if (agentName.toLowerCase().includes('coordinator')) {
+          agentType = 'coordinator';
+        }
+
+        const newMessage: AIBlock = {
+          id: `ws-${Date.now()}-${Math.random()}`,
+          name: agentName,
+          type: agentType,
+          content: data.content,
+          timestamp: data.timestamp || new Date().toISOString(),
+          iteration: realTimeMessages.length + 1
+        };
+
+        setRealTimeMessages(prev => [...prev, newMessage]);
+        setInteractions(prev => [...prev, newMessage]);
+        console.log('🔄 Added real-time message:', newMessage);
+      }
+    };
+
+    const handleWorkflowStatus = (data: any) => {
+      console.log('📊 Received workflow status via WebSocket:', data);
+      if (data.status === 'completed' || data.status === 'error') {
+        setIsLoading(false);
+        const statusMessage: AIBlock = {
+          id: `status-${Date.now()}`,
+          name: 'System',
+          type: 'coordinator',
+          content: data.status === 'completed' ? '✅ Workflow completed successfully!' : '❌ Workflow failed',
+          timestamp: new Date().toISOString(),
+          iteration: realTimeMessages.length + 1
+        };
+        setRealTimeMessages(prev => [...prev, statusMessage]);
+      }
+    };
+
+    const handleTestMessage = (data: any) => {
+      console.log('🧪 Received test message via WebSocket:', data);
+      const testMessage: AIBlock = {
+        id: `test-${Date.now()}`,
+        name: 'System',
+        type: 'coordinator',
+        content: `🧪 WebSocket Test: ${data.message || 'Connection working!'}`,
+        timestamp: new Date().toISOString(),
+        iteration: realTimeMessages.length + 1
+      };
+      setRealTimeMessages(prev => [...prev, testMessage]);
+    };
+
+    // Subscribe to WebSocket events
+    websocketService.on('connected', handleConnected);
+    websocketService.on('disconnected', handleDisconnected);
+    websocketService.on('agent_message', handleAgentMessage);
+    websocketService.on('workflow_status', handleWorkflowStatus);
+    websocketService.on('test_response', handleTestMessage);
+
+    // Connect to WebSocket
+    websocketService.connect();
+
+    // Cleanup
+    return () => {
+      websocketService.off('connected', handleConnected);
+      websocketService.off('disconnected', handleDisconnected);
+      websocketService.off('agent_message', handleAgentMessage);
+      websocketService.off('workflow_status', handleWorkflowStatus);
+      websocketService.off('test_response', handleTestMessage);
+    };
+  }, [realTimeMessages.length]);
 
   // Conversation handlers
   const handleNewConversation = async () => {
@@ -155,8 +256,14 @@ export default function AICommunicationPage() {
 
   const handlePromptSubmit = async (prompt: string) => {
     try {
-      setIsLoading(true);
+      // Only show loading if WebSocket is not connected
+      if (!wsConnected) {
+        setIsLoading(true);
+      }
       setError(null);
+      
+      // Clear real-time messages for new conversation
+      setRealTimeMessages([]);
       
       // Create user interaction block
       const userInteraction: AIBlock = {
@@ -165,10 +272,29 @@ export default function AICommunicationPage() {
         type: 'coordinator',
         content: prompt,
         timestamp: new Date().toISOString(),
-        iteration: interactions.length + 1
+        iteration: 1
       };
 
-      // Send prompt to backend
+      // Add user message to real-time messages and interactions
+      setRealTimeMessages([userInteraction]);
+      setInteractions(prev => [...prev, userInteraction]);
+
+      // Send test message via WebSocket to verify connection
+      if (wsConnected) {
+        websocketService.send({
+          type: 'test',
+          message: 'Starting AI workflow - testing real-time communication',
+          timestamp: new Date().toISOString()
+        });
+        
+        // Don't wait for API response if WebSocket is connected
+        // The WebSocket messages will update the UI in real-time
+        console.log('🔗 WebSocket connected - using real-time communication');
+        return;
+      }
+
+      // Only call API if WebSocket is not connected
+      console.log('⚠️ WebSocket not connected - using API fallback');
       const response = await chatWithAgents({
         prompt,
         conversation_id: currentConversationId
@@ -184,7 +310,7 @@ export default function AICommunicationPage() {
           type: 'coder',
           content: response.code,
           timestamp: new Date().toISOString(),
-          iteration: interactions.length + 2
+          iteration: 2
         });
       }
 
@@ -195,7 +321,7 @@ export default function AICommunicationPage() {
           type: 'tester',
           content: response.tests,
           timestamp: new Date().toISOString(),
-          iteration: interactions.length + 3
+          iteration: 3
         });
       }
 
@@ -206,12 +332,12 @@ export default function AICommunicationPage() {
           type: 'runner',
           content: response.test_results,
           timestamp: new Date().toISOString(),
-          iteration: interactions.length + 4
+          iteration: 4
         });
       }
       
       // Update interactions with new blocks
-      setInteractions(prev => [...prev, userInteraction, ...aiInteractions]);
+      setInteractions(prev => [...prev, ...aiInteractions]);
       
       // Refresh conversation list to show updated conversation
       if (conversationHistoryRef.current) {
@@ -302,6 +428,38 @@ export default function AICommunicationPage() {
           </span>
         </div>
       )}
+
+      {/* WebSocket Status */}
+      <div className={`absolute top-4 left-64 flex items-center space-x-2 px-3 py-1 rounded text-sm ${
+        wsConnected ? 'bg-blue-100 text-blue-800' : 'bg-yellow-100 text-yellow-800'
+      }`}>
+        <div className={`w-2 h-2 rounded-full ${
+          wsConnected ? 'bg-blue-500' : 'bg-yellow-500'
+        }`}></div>
+        <span>
+          {wsConnected ? 'WebSocket Live' : 'WebSocket Connecting...'}
+        </span>
+      </div>
+
+      {/* WebSocket Test Button */}
+      <button
+        onClick={() => {
+          websocketService.testConnection();
+          const testMessage: AIBlock = {
+            id: `test-${Date.now()}`,
+            name: 'System',
+            type: 'coordinator',
+            content: `🧪 Testing WebSocket connection... Status: ${wsStatus}`,
+            timestamp: new Date().toISOString(),
+            iteration: realTimeMessages.length + 1
+          };
+          setRealTimeMessages(prev => [...prev, testMessage]);
+        }}
+        className="absolute top-4 left-96 px-3 py-1 bg-purple-600 text-white rounded text-sm hover:bg-purple-700 transition-colors"
+        title={`WebSocket Status: ${wsStatus}`}
+      >
+        Test WS
+      </button>
     </div>
   );
 } 

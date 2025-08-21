@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { runManualFlow, testOnlineServiceConnection, getOnlineModels, runOnlineWorkflow, OnlineAgent, OnlineWorkflowRequest } from '../services/api';
+import { runManualFlow, testOnlineServiceConnection, getOnlineModels, runOnlineWorkflow, getOnlineWorkflowStatus, OnlineAgent, OnlineWorkflowRequest, OnlineWorkflowResponse } from '../services/api';
+import websocketService from '../services/websocket';
 
 export type AgentType = 'coordinator' | 'coder' | 'tester' | 'runner' | 'custom';
 
@@ -91,11 +92,17 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
   const [resizingPopup, setResizingPopup] = useState<{ id: string; startX: number; startY: number; startW: number; startH: number } | null>(null);
   const [draggingPopup, setDraggingPopup] = useState<{ id: string; offsetX: number; offsetY: number }>();
 
+  // Selection and modes
+  const [selectedBoxId, setSelectedBoxId] = useState<string | null>(null);
+  const [connectMode, setConnectMode] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
+
   // Pin state for agent boxes
   const [pinnedBoxes, setPinnedBoxes] = useState<Record<string, boolean>>({});
 
   // Agent messages and workflow state
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
+  const [showConversation, setShowConversation] = useState(false);
   const [isOnlineMode, setIsOnlineMode] = useState(false);
   const [onlineServiceConnected, setOnlineServiceConnected] = useState(false);
   const [geminiAvailable, setGeminiAvailable] = useState(false);
@@ -109,50 +116,201 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
 
   // Online/Offline mode state
   const [onlineModels, setOnlineModels] = useState<any>(null);
+  const [modelsLoading, setModelsLoading] = useState(false);
+
+  // WebSocket connection state
+  const [wsConnected, setWsConnected] = useState(false);
+  const [wsStatus, setWsStatus] = useState('CLOSED');
 
 
-  // Define online model options with Gemini availability status
-  const onlineModelOptions = [
-    { 
-      value: 'gemini-pro', 
-      label: geminiAvailable ? 'Gemini Pro (Google) - Recommended ✨' : 'Gemini Pro (Google) - Not Available' 
-    },
-    { 
-      value: 'gemini-pro-vision', 
-      label: geminiAvailable ? 'Gemini Pro Vision (Google) ✨' : 'Gemini Pro Vision (Google) - Not Available' 
-    },
-    { value: 'mistral-small', label: 'Mistral Small' },
-    { value: 'mistral-medium', label: 'Mistral Medium' },
-    { value: 'mistral-large', label: 'Mistral Large' },
-    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo (OpenAI) - Quota Limited' },
-    { value: 'gpt-4', label: 'GPT-4 (OpenAI) - Quota Limited' },
-    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo (OpenAI) - Quota Limited' }
-  ];
+  // Generate online model options dynamically based on available models
+  const getOnlineModelOptions = () => {
+    if (!onlineModels || !onlineModels.available_models) {
+      return [
+        { value: 'mistral-small', label: 'Mistral Small (Default)' }
+      ];
+    }
+
+    const availableModels = onlineModels.available_models;
+    const options = [];
+
+    // Add Gemini models if available
+    if ('gemini-pro' in availableModels) {
+      options.push({ 
+        value: 'gemini-pro', 
+        label: 'Gemini Pro (Google) - Recommended ✨' 
+      });
+    }
+    if ('gemini-pro-vision' in availableModels) {
+      options.push({ 
+        value: 'gemini-pro-vision', 
+        label: 'Gemini Pro Vision (Google) ✨' 
+      });
+    }
+
+    // Add Mistral models if available
+    if ('mistral-small' in availableModels) {
+      options.push({ value: 'mistral-small', label: 'Mistral Small' });
+    }
+    if ('mistral-medium' in availableModels) {
+      options.push({ value: 'mistral-medium', label: 'Mistral Medium' });
+    }
+    if ('mistral-large' in availableModels) {
+      options.push({ value: 'mistral-large', label: 'Mistral Large' });
+    }
+
+    // Add OpenAI models if available
+    if ('gpt-3.5-turbo' in availableModels) {
+      options.push({ value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo (OpenAI) - Quota Limited' });
+    }
+    if ('gpt-4' in availableModels) {
+      options.push({ value: 'gpt-4', label: 'GPT-4 (OpenAI) - Quota Limited' });
+    }
+    if ('gpt-4-turbo' in availableModels) {
+      options.push({ value: 'gpt-4-turbo', label: 'GPT-4 Turbo (OpenAI) - Quota Limited' });
+    }
+
+    // If no models are available, provide a fallback
+    if (options.length === 0) {
+      options.push({ value: 'mistral-small', label: 'Mistral Small (Fallback)' });
+    }
+
+    return options;
+  };
+
+  const onlineModelOptions = getOnlineModelOptions();
+
+  // WebSocket event handlers
+  useEffect(() => {
+    const handleConnected = () => {
+      setWsConnected(true);
+      setWsStatus('OPEN');
+      console.log('🔗 WebSocket connected to ManualAgentCanvas');
+    };
+
+    const handleDisconnected = () => {
+      setWsConnected(false);
+      setWsStatus('CLOSED');
+      console.log('🔌 WebSocket disconnected from ManualAgentCanvas');
+    };
+
+    const handleAgentMessage = (data: any) => {
+      console.log('📨 Received agent message via WebSocket:', data);
+      // Update agent messages in real-time
+      if (data.content && data.from_agent && data.to_agent) {
+        const newMessage = {
+          id: `ws-${Date.now()}-${Math.random()}`,
+          agentId: data.from_agent,
+          agentType: data.from_agent,
+          agentName: data.from_agent,
+          content: data.content,
+          timestamp: data.timestamp || new Date().toISOString(),
+          fromAgent: data.from_agent,
+          toAgent: data.to_agent
+        };
+        console.log('🔄 Adding new message to conversation:', newMessage);
+        setAgentMessages(prev => {
+          const updated = [...prev, newMessage];
+          console.log('📝 Total messages now:', updated.length);
+          return updated;
+        });
+        
+        // Force conversation panel to show
+        setShowConversation(true);
+      }
+    };
+
+    const handleWorkflowStatus = (data: any) => {
+      console.log('📊 Received workflow status via WebSocket:', data);
+      // Update workflow status in real-time
+      if (data.status === 'completed' || data.status === 'error') {
+        setIsRunning(false);
+        setAgentMessages(prev => [...prev, {
+          id: `status-${Date.now()}`,
+          agentId: 'system',
+          agentType: 'system',
+          agentName: 'System',
+          content: data.status === 'completed' ? '✅ Workflow completed successfully!' : '❌ Workflow failed',
+          timestamp: new Date().toISOString(),
+          fromAgent: 'System',
+          toAgent: 'Workflow'
+        }]);
+      }
+    };
+
+    const handleTestMessage = (data: any) => {
+      console.log('🧪 Received test message via WebSocket:', data);
+      setAgentMessages(prev => [...prev, {
+        id: `test-${Date.now()}`,
+        agentId: 'system',
+        agentType: 'system',
+        agentName: 'System',
+        content: `🧪 WebSocket Test: ${data.message || 'Connection working!'}`,
+        timestamp: new Date().toISOString(),
+        fromAgent: 'System',
+        toAgent: 'Test'
+      }]);
+      setShowConversation(true);
+    };
+
+    // Subscribe to WebSocket events
+    websocketService.on('connected', handleConnected);
+    websocketService.on('disconnected', handleDisconnected);
+    websocketService.on('agent_message', handleAgentMessage);
+    websocketService.on('workflow_status', handleWorkflowStatus);
+    websocketService.on('test_response', handleTestMessage);
+
+    // Connect to WebSocket for real-time communication (both online and offline modes)
+    websocketService.connect();
+
+    // Cleanup
+    return () => {
+      websocketService.off('connected', handleConnected);
+      websocketService.off('disconnected', handleDisconnected);
+      websocketService.off('agent_message', handleAgentMessage);
+      websocketService.off('workflow_status', handleWorkflowStatus);
+      websocketService.off('test_response', handleTestMessage);
+    };
+  }, []); // Remove isOnlineMode dependency to always connect
+
+  // Debug conversation panel visibility
+  useEffect(() => {
+    console.log('🔍 Conversation panel debug:', { showConversation, messageCount: agentMessages.length });
+  }, [showConversation, agentMessages.length]);
 
   // Check online service connection and model availability
   useEffect(() => {
     if (isOnlineMode) {
+      setModelsLoading(true);
       testOnlineServiceConnection().then(connected => {
         setOnlineServiceConnected(connected);
         if (connected) {
           getOnlineModels().then(models => {
             setOnlineModels(models);
+            console.log('Available models:', models.available_models);
             // Check if Gemini models are available
             const hasGemini = models.available_models && (
               'gemini-pro' in models.available_models || 
               'gemini-pro-vision' in models.available_models
             );
             setGeminiAvailable(hasGemini);
+            setModelsLoading(false);
           }).catch(err => {
             console.error('Failed to get online models:', err);
             setGeminiAvailable(false);
+            setModelsLoading(false);
           });
+        } else {
+          setModelsLoading(false);
         }
       }).catch(err => {
         console.error('Failed to test online service connection:', err);
         setOnlineServiceConnected(false);
         setGeminiAvailable(false);
+        setModelsLoading(false);
       });
+    } else {
+      setModelsLoading(false);
     }
   }, [isOnlineMode]);
 
@@ -171,20 +329,138 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
 
     setIsRunning(true);
     setAgentMessages([]);
+    // Don't hide the conversation panel - keep it visible
 
     try {
-      let data;
+      let data: OnlineWorkflowResponse | any;
       
       if (isOnlineMode) {
-        // Convert boxes to online agent format
-        const onlineAgents: OnlineAgent[] = boxes.map(box => ({
-          id: box.id,
-          name: box.role || box.agentType,
-          role: box.role || box.agentType,
-          model: box.model || 'mistral-small', // Use Mistral as default since OpenAI quota exceeded
-          system_prompt: box.roleDescription || `You are a ${box.role || box.agentType} agent. Perform your role effectively.`,
-          memory_enabled: true
-        }));
+        // Convert boxes to online agent format with improved system prompts
+        const onlineAgents: OnlineAgent[] = boxes.map(box => {
+          let systemPrompt = box.roleDescription;
+          
+          // If no custom role description, create specific prompts based on agent type
+          if (!systemPrompt) {
+            const role = box.role || box.agentType;
+            switch (role.toLowerCase()) {
+              case 'coordinator':
+                // Get list of actual available agents for this coordinator
+                const availableAgents = boxes.map(box => box.role || box.agentType).filter(role => role.toLowerCase() !== 'coordinator');
+                const agentList = availableAgents.length > 0 ? availableAgents.join(', ') : 'none';
+                
+                systemPrompt = `You are a Coordinator agent. Your role is to:
+- Delegate tasks to other agents
+- Report final results when the task is complete
+- Only speak when delegating or reporting final results
+- Be concise and direct
+- Do NOT pretend to be other agents or create fake conversations
+- Do NOT continue the conversation after the task is complete
+
+AVAILABLE AGENTS: ${agentList}
+
+IMPORTANT RULES:
+- Only delegate to agents that actually exist: ${agentList}
+- Do NOT mention agents that don't exist
+- If no other agents exist, complete the task yourself
+- When the task is done, simply say "Task completed successfully" and STOP
+- If you need to delegate but no suitable agents exist, say "No suitable agents available for this task. Workflow complete." and STOP`;
+                break;
+              case 'coder':
+              case 'developer':
+                // Get list of actual available agents
+                const availableAgentsForCoder = boxes.map(box => box.role || box.agentType).filter(role => role.toLowerCase() !== 'coder' && role.toLowerCase() !== 'developer');
+                const agentListForCoder = availableAgentsForCoder.length > 0 ? availableAgentsForCoder.join(', ') : 'none';
+                
+                systemPrompt = `You are a Coder agent. Your role is to:
+- Write code when asked
+- Provide code solutions
+- Be concise and direct
+- Only speak when providing code
+- Do NOT pretend to be other agents or create fake conversations
+- Do NOT continue the conversation after providing code
+
+AVAILABLE AGENTS: ${agentListForCoder}
+
+IMPORTANT RULES:
+- Only mention agents that actually exist: ${agentListForCoder}
+- Do NOT mention agents that don't exist
+- When you provide code, simply say "Code provided" and STOP
+- Do NOT delegate to non-existent agents`;
+                break;
+              case 'tester':
+                // Get list of actual available agents
+                const availableAgentsForTester = boxes.map(box => box.role || box.agentType).filter(role => role.toLowerCase() !== 'tester');
+                const agentListForTester = availableAgentsForTester.length > 0 ? availableAgentsForTester.join(', ') : 'none';
+                
+                systemPrompt = `You are a Tester agent. Your role is to:
+- Test code when provided
+- Report test results
+- Be concise and direct
+- Only speak when testing or reporting results
+- Do NOT pretend to be other agents or create fake conversations
+- Do NOT continue the conversation after reporting test results
+
+AVAILABLE AGENTS: ${agentListForTester}
+
+IMPORTANT RULES:
+- Only mention agents that actually exist: ${agentListForTester}
+- Do NOT mention agents that don't exist
+- When you report test results, simply say "Testing complete" and STOP
+- Do NOT delegate to non-existent agents`;
+                break;
+              case 'runner':
+              case 'executor':
+                // Get list of actual available agents
+                const availableAgentsForRunner = boxes.map(box => box.role || box.agentType).filter(role => role.toLowerCase() !== 'runner' && role.toLowerCase() !== 'executor');
+                const agentListForRunner = availableAgentsForRunner.length > 0 ? availableAgentsForRunner.join(', ') : 'none';
+                
+                systemPrompt = `You are a Runner agent. Your role is to:
+- Execute code when provided
+- Report execution results
+- Be concise and direct
+- Only speak when executing or reporting results
+- Do NOT pretend to be other agents or create fake conversations
+- Do NOT continue the conversation after reporting execution results
+
+AVAILABLE AGENTS: ${agentListForRunner}
+
+IMPORTANT RULES:
+- Only mention agents that actually exist: ${agentListForRunner}
+- Do NOT mention agents that don't exist
+- When you report execution results, simply say "Execution complete" and STOP
+- Do NOT delegate to non-existent agents`;
+                break;
+              default:
+                // Get list of actual available agents
+                const availableAgentsForDefault = boxes.map(box => box.role || box.agentType).filter(agentRole => agentRole.toLowerCase() !== role.toLowerCase());
+                const agentListForDefault = availableAgentsForDefault.length > 0 ? availableAgentsForDefault.join(', ') : 'none';
+                
+                systemPrompt = `You are a ${role} agent. Your role is to:
+- Perform your specific role effectively
+- Be concise and direct
+- Only speak when necessary
+- Do NOT pretend to be other agents or create fake conversations
+- Do NOT continue the conversation after completing your task
+
+AVAILABLE AGENTS: ${agentListForDefault}
+
+IMPORTANT RULES:
+- Only mention agents that actually exist: ${agentListForDefault}
+- Do NOT mention agents that don't exist
+- When your task is done, simply say "Task complete" and STOP
+- Do NOT delegate to non-existent agents`;
+            }
+          }
+          
+          return {
+            id: box.id,
+            name: box.role || box.agentType,
+            role: box.role || box.agentType,
+            model: box.model || 'mistral-small',
+            system_prompt: systemPrompt,
+            memory_enabled: true
+          };
+        });
 
         const onlineRequest: OnlineWorkflowRequest = {
           task: prompt.trim(),
@@ -193,21 +469,113 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
           conversation_id: undefined // Don't create a database conversation for manual flow
         };
 
-        data = await runOnlineWorkflow(onlineRequest);
+        const onlineData = await runOnlineWorkflow(onlineRequest);
+        data = onlineData;
         console.log('Online workflow response:', data);
-        // Convert online message format to frontend format
-        const convertedMessages = (data.message_history || []).map((msg: any) => ({
-          id: msg.id,
-          agentId: msg.from_agent, // Use from_agent as agentId for display
-          agentType: msg.from_agent,
-          agentName: msg.from_agent,
-          content: msg.content,
-          timestamp: msg.timestamp,
-          fromAgent: msg.from_agent,
-          toAgent: msg.to_agent
-        }));
-        console.log('Converted messages:', convertedMessages);
-        setAgentMessages(convertedMessages);
+        
+        // Create a mapping from agent IDs to names
+        const agentIdToName = new Map();
+        boxes.forEach(box => {
+          agentIdToName.set(box.id, box.role || box.agentType);
+        });
+        console.log('Agent ID to Name mapping:', Object.fromEntries(agentIdToName));
+        
+        // Show conversation panel immediately when workflow starts
+        setShowConversation(true);
+        
+        // Set initial messages if any exist
+        if (data.message_history && data.message_history.length > 0) {
+          const initialMessages = (data.message_history || []).map((msg: any) => ({
+            id: msg.id,
+            agentId: msg.from_agent,
+            agentType: agentIdToName.get(msg.from_agent) || msg.from_agent,
+            agentName: agentIdToName.get(msg.from_agent) || msg.from_agent,
+            content: msg.content,
+            timestamp: msg.timestamp,
+            fromAgent: agentIdToName.get(msg.from_agent) || msg.from_agent,
+            toAgent: agentIdToName.get(msg.to_agent) || msg.to_agent
+          }));
+          setAgentMessages(initialMessages);
+        } else {
+          // Add a loading message to show the workflow has started
+          setAgentMessages([{
+            id: 'loading-1',
+            agentId: 'system',
+            agentType: 'system',
+            agentName: 'System',
+            content: '🤖 Starting workflow...',
+            timestamp: new Date().toISOString(),
+            fromAgent: 'System',
+            toAgent: 'Workflow'
+          }]);
+        }
+        
+        // Start polling for live updates if workflow is still running
+        if (data.workflow_id && data.status !== 'completed' && data.status !== 'error') {
+          const pollInterval = setInterval(async () => {
+            try {
+              const status = await getOnlineWorkflowStatus(data.workflow_id);
+              console.log('Workflow status update:', status);
+              
+              // Update messages with latest history
+              const updatedMessages = (status.message_history || []).map((msg: any) => ({
+                id: msg.id,
+                agentId: msg.from_agent,
+                agentType: agentIdToName.get(msg.from_agent) || msg.from_agent,
+                agentName: agentIdToName.get(msg.from_agent) || msg.from_agent,
+                content: msg.content,
+                timestamp: msg.timestamp,
+                fromAgent: agentIdToName.get(msg.from_agent) || msg.from_agent,
+                toAgent: agentIdToName.get(msg.to_agent) || msg.to_agent
+              }));
+              
+              // Remove loading message if we have real messages
+              const filteredMessages = updatedMessages.filter((msg: any) => msg.id !== 'loading-1');
+              setAgentMessages(filteredMessages);
+              
+              // Add progress indicator if workflow is still running
+              if (status.status === 'running' && filteredMessages.length > 0) {
+                const lastMessage = filteredMessages[filteredMessages.length - 1];
+                if (!lastMessage.content.includes('⏳')) {
+                  setAgentMessages(prev => [...prev, {
+                    id: `progress-${Date.now()}`,
+                    agentId: 'system',
+                    agentType: 'system',
+                    agentName: 'System',
+                    content: '⏳ Processing...',
+                    timestamp: new Date().toISOString(),
+                    fromAgent: 'System',
+                    toAgent: 'Workflow'
+                  }]);
+                }
+              }
+              
+              // Stop polling when workflow completes
+              if (status.status === 'completed' || status.status === 'error') {
+                clearInterval(pollInterval);
+                console.log('Workflow completed with status:', status.status);
+                
+                // Add completion message
+                setAgentMessages(prev => [...prev, {
+                  id: `completion-${Date.now()}`,
+                  agentId: 'system',
+                  agentType: 'system',
+                  agentName: 'System',
+                  content: status.status === 'completed' ? '✅ Workflow completed successfully!' : '❌ Workflow failed',
+                  timestamp: new Date().toISOString(),
+                  fromAgent: 'System',
+                  toAgent: 'Workflow'
+                }]);
+              }
+            } catch (error) {
+              console.error('Error polling workflow status:', error);
+              clearInterval(pollInterval);
+            }
+          }, 500); // Poll every 500ms for more responsive updates
+          
+          // Clean up interval when component unmounts or flow stops
+          return () => clearInterval(pollInterval);
+        }
       } else {
         // Use offline mode
         // Convert boxes to include roleDescription for offline mode
@@ -217,9 +585,41 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
           role: box.role || box.agentType,
           description: box.roleDescription || `You are a ${box.role || box.agentType} agent.`
         }));
+        
+        // Show conversation panel immediately when workflow starts
+        setShowConversation(true);
+        
+        // Add a loading message to show the workflow has started
+        setAgentMessages([{
+          id: 'loading-1',
+          agentId: 'system',
+          agentType: 'system',
+          agentName: 'System',
+          content: '🤖 Starting offline workflow...',
+          timestamp: new Date().toISOString(),
+          fromAgent: 'System',
+          toAgent: 'Workflow'
+        }]);
+        
+        // Test WebSocket connection by sending a test message
+        console.log('🧪 Testing WebSocket connection during workflow start...');
+        websocketService.send({
+          type: 'test',
+          message: 'Workflow started - testing real-time communication',
+          timestamp: new Date().toISOString()
+        });
+        
         data = await runManualFlow(prompt.trim(), offlineBoxes, connections);
         console.log('Offline workflow response:', data);
-        setAgentMessages(data.messages || []);
+        
+        // Update messages with the response
+        if (data.messages && data.messages.length > 0) {
+          // Remove loading message and add real messages
+          setAgentMessages(data.messages.filter((msg: any) => msg.id !== 'loading-1'));
+        } else {
+          // Keep the loading message if no messages returned
+          setAgentMessages(prev => prev.filter(msg => msg.id !== 'loading-1'));
+        }
       }
 
       if (data.generated_files && data.generated_files.length > 0) {
@@ -263,6 +663,9 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
     if (box) {
       setDragId(id);
       setOffset({ x: e.clientX - box.x, y: e.clientY - box.y });
+      setSelectedBoxId(id);
+      // Deselect any selected connection when a box is selected
+      setSelectedConnectionId(null);
     }
   };
 
@@ -280,6 +683,7 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
   // Connection handle drag start
   const handleHandleMouseDown = (e: React.MouseEvent, boxId: string, side: BoxSide) => {
     e.stopPropagation();
+    if (!connectMode) return;
     const box = boxes.find(b => b.id === boxId);
     if (!box) return;
     const { x, y, width, height } = box;
@@ -581,7 +985,16 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
         top: 0,
         left: 0
       }}
-      viewBox="0 0 100% 100%"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          setSelectedBoxId(null);
+          setSelectedConnectionId(null);
+          if (connectDrag) {
+            setConnectDrag(null);
+            setDragOverHandle(null);
+          }
+        }
+      }}
       preserveAspectRatio="none"
     >
       {connections.map(conn => {
@@ -600,11 +1013,11 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
             <path
               d={getSmartBezierPath(fromX, fromY, toX, toY)}
               stroke="#f97316"
-              strokeWidth={3}
+              strokeWidth={selectedConnectionId === conn.id ? 4 : 3}
               fill="none"
               markerEnd="url(#arrowhead)"
               style={{ cursor: 'pointer', pointerEvents: 'stroke' }}
-              onClick={e => { e.stopPropagation(); setSelectedConnectionId(conn.id); }}
+              onClick={e => { e.stopPropagation(); setSelectedBoxId(null); setSelectedConnectionId(conn.id); }}
             />
             {renderPopupForConnection(conn, from, to, centerX, centerY)}
           </g>
@@ -636,6 +1049,7 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
 
   // Render connection handles for a box
   const renderHandles = (box: ManualAgentBox) => {
+    if (!connectMode) return null;
     // Show handles only on hover or when dragging a connection from this box
     const show = hoveredBoxId === box.id || (connectDrag && connectDrag.fromId === box.id);
     return (
@@ -698,11 +1112,15 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
             width: box.width,
             height: box.height,
             background: isDark ? '#23272F' : '#fff',
-            border: dragId === box.id || resizeId === box.id ? '2.5px solid #2563eb' : 
-                   isActive ? '2px solid #10b981' : '2px solid #888',
+            border: selectedBoxId === box.id
+              ? '2.5px solid #f97316'
+              : (dragId === box.id || resizeId === box.id ? '2.5px solid #2563eb' : 
+                 (isActive ? '2px solid #10b981' : '2px solid #888')),
             borderRadius: 12,
-            boxShadow: dragId === box.id || resizeId === box.id ? '0 4px 16px rgba(37,99,235,0.15)' : 
-                      isActive ? '0 4px 16px rgba(16,185,129,0.15)' : '0 2px 8px rgba(0,0,0,0.12)',
+            boxShadow: selectedBoxId === box.id
+              ? '0 4px 16px rgba(249,115,22,0.18)'
+              : (dragId === box.id || resizeId === box.id ? '0 4px 16px rgba(37,99,235,0.15)' : 
+                 (isActive ? '0 4px 16px rgba(16,185,129,0.15)' : '0 2px 8px rgba(0,0,0,0.12)')),
             zIndex: 2,
             padding: 12,
             cursor: pinnedBoxes[box.id] ? 'default' : dragId === box.id ? 'grabbing' : 'grab',
@@ -793,8 +1211,9 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
           {/* Model Selection */}
           <div style={{ marginBottom: 8 }}>
             <select
-              value={box.model || (isOnlineMode ? 'gemini-pro' : 'mistral')}
+              value={box.model || (isOnlineMode ? (onlineModelOptions[0]?.value || 'mistral-small') : 'mistral')}
               onChange={e => handleBoxChange(box.id, 'model', e.target.value)}
+              disabled={isOnlineMode && modelsLoading}
               style={{
                 background: isDark ? '#181A20' : '#f9f9f9',
                 color: isDark ? '#fff' : '#222',
@@ -805,11 +1224,16 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
                 outline: 'none',
                 width: '100%',
                 transition: 'border 0.15s',
+                opacity: isOnlineMode && modelsLoading ? 0.6 : 1,
               }}
             >
-              {(isOnlineMode ? onlineModelOptions : offlineModelOptions).map(opt => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
+              {isOnlineMode && modelsLoading ? (
+                <option value="">Loading models...</option>
+              ) : (
+                (isOnlineMode ? onlineModelOptions : offlineModelOptions).map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))
+              )}
             </select>
           </div>
           
@@ -986,34 +1410,156 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
     handlePopupResizeMouseUp(e);
   };
 
-  // Cancel connection drag on Escape key
+  // Keyboard shortcuts: Esc to cancel connect/selection, Delete to delete selection
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = (target?.tagName || '').toLowerCase();
+      const isTyping = tag === 'input' || tag === 'textarea' || (target?.isContentEditable ?? false) || tag === 'select';
+      if (isTyping) return;
+
       if (e.key === 'Escape') {
         setConnectDrag(null);
         setDragOverHandle(null);
+        if (connectMode) setConnectMode(false);
+        setSelectedConnectionId(null);
+        setSelectedBoxId(null);
+      }
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (selectedBoxId) {
+          setBoxes(prev => prev.filter(b => b.id !== selectedBoxId));
+          setConnections(prev => prev.filter(c => c.fromId !== selectedBoxId && c.toId !== selectedBoxId));
+          setSelectedBoxId(null);
+        } else if (selectedConnectionId) {
+          setConnections(prev => prev.filter(c => c.id !== selectedConnectionId));
+          setSelectedConnectionId(null);
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [connectMode, selectedBoxId, selectedConnectionId]);
 
   // Cancel connection drag on canvas click (not on box/handle)
   const handleCanvasClick = (e: React.MouseEvent) => {
-    if (connectDrag && e.target === canvasRef.current) {
-      setConnectDrag(null);
-      setDragOverHandle(null);
+    if (e.target === canvasRef.current) {
+      setSelectedBoxId(null);
+      setSelectedConnectionId(null);
+      if (connectDrag) {
+        setConnectDrag(null);
+        setDragOverHandle(null);
+      }
     }
+  };
+
+  // Export/Import Handlers
+  const handleExport = () => {
+    try {
+      const exportData = {
+        version: 1,
+        prompt,
+        boxes,
+        connections,
+        pinnedBoxes,
+        canvasScale,
+        canvasOffset,
+        timestamp: new Date().toISOString(),
+      };
+      const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `manual_agents_${Date.now()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert('Failed to export configuration.');
+    }
+  };
+
+  const handleImportClick = () => {
+    importInputRef.current?.click();
+  };
+
+  const handleImportChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = String(reader.result || '');
+        const data = JSON.parse(text);
+        if (!data || !Array.isArray(data.boxes) || !Array.isArray(data.connections)) {
+          throw new Error('Invalid file format.');
+        }
+        setBoxes(data.boxes || []);
+        setConnections(data.connections || []);
+        setPinnedBoxes(data.pinnedBoxes || {});
+        if (typeof data.prompt === 'string') setPrompt(data.prompt);
+        if (typeof data.canvasScale === 'number') setCanvasScale(data.canvasScale);
+        if (data.canvasOffset && typeof data.canvasOffset.x === 'number' && typeof data.canvasOffset.y === 'number') {
+          setCanvasOffset({ x: data.canvasOffset.x, y: data.canvasOffset.y });
+        }
+        setAgentMessages([]);
+        setSelectedBoxId(null);
+        setSelectedConnectionId(null);
+        // Reset connect mode and any in-progress drags/popups
+        setConnectDrag(null);
+        setDragOverHandle(null);
+        setConnectMode(false);
+        setPopupStates({});
+        alert('Configuration imported successfully.');
+      } catch (err) {
+        console.error('Import error:', err);
+        alert('Failed to import configuration. Make sure the JSON is valid.');
+      } finally {
+        // Reset the input so the same file can be re-imported if needed
+        e.target.value = '';
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleClearCanvas = () => {
+    const ok = window.confirm('Clear canvas? This will remove all agents, connections, and messages.');
+    if (!ok) return;
+    setBoxes([]);
+    setConnections([]);
+    setAgentMessages([]);
+    setSelectedBoxId(null);
+    setSelectedConnectionId(null);
+    setConnectDrag(null);
+    setDragOverHandle(null);
+    setConnectMode(false);
+    setPopupStates({});
   };
 
   return (
     <div
       ref={canvasRef}
-      style={{ width: '100%', height: '100%', position: 'relative', background: isDark ? '#181A20' : '#f4f4f4', cursor: 'default' }}
+      style={{ 
+        width: '100%', 
+        height: '100%', 
+        position: 'relative', 
+        background: isDark ? '#181A20' : '#f4f4f4', 
+        cursor: 'default',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
+      }}
       onMouseMove={handleCanvasMouseMove}
       onMouseUp={handleCanvasMouseUp}
       onClick={handleCanvasClick}
     >
+      <style>
+        {`
+          @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+          }
+        `}
+      </style>
       {/* Top controls row */}
       <div
         style={{
@@ -1030,11 +1576,205 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
           pointerEvents: 'auto',
         }}
       >
+        {/* Hidden input for Import */}
+        <input
+          type="file"
+          accept="application/json,.json"
+          ref={importInputRef}
+          style={{ display: 'none' }}
+          onChange={handleImportChange}
+        />
         <button
-          style={{ background: '#2563eb', color: '#fff', border: 'none', borderRadius: 6, padding: '8px 16px', fontWeight: 600, fontSize: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.08)', cursor: 'pointer' }}
+          style={{ 
+            background: '#2563eb', 
+            color: '#fff', 
+            border: 'none', 
+            borderRadius: 8, 
+            padding: '10px 18px', 
+            fontWeight: 600, 
+            fontSize: 14, 
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)', 
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            transition: 'all 0.2s'
+          }}
           onClick={handleCreateBox}
         >
-          + Create an empty box
+          <span style={{ fontSize: '16px' }}>➕</span>
+          Add Agent
+        </button>
+
+        {/* Connect Mode Toggle */}
+        <button
+          style={{ 
+            background: connectMode ? '#f97316' : (isDark ? '#444' : '#eee'), 
+            color: connectMode ? '#fff' : (isDark ? '#fff' : '#222'), 
+            border: 'none', 
+            borderRadius: 8, 
+            padding: '10px 18px', 
+            fontWeight: 600, 
+            fontSize: 14, 
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)', 
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            transition: 'all 0.2s'
+          }}
+          onClick={() => setConnectMode(prev => !prev)}
+          title="Toggle Connect Mode (Esc to cancel)"
+        >
+          <span style={{ fontSize: '16px' }}>🕸️</span>
+          {connectMode ? 'Connecting...' : 'Connect'}
+        </button>
+
+        {/* Clear Canvas */}
+        <button
+          style={{ 
+            background: '#ef4444', 
+            color: '#fff', 
+            border: 'none', 
+            borderRadius: 8, 
+            padding: '10px 18px', 
+            fontWeight: 600, 
+            fontSize: 14, 
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)', 
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            transition: 'all 0.2s'
+          }}
+          onClick={handleClearCanvas}
+          title="Clear canvas"
+        >
+          <span style={{ fontSize: '16px' }}>🧹</span>
+          Clear
+        </button>
+
+        {/* Export / Import */}
+        <button
+          style={{ 
+            background: '#0ea5e9', 
+            color: '#fff', 
+            border: 'none', 
+            borderRadius: 8, 
+            padding: '10px 18px', 
+            fontWeight: 600, 
+            fontSize: 14, 
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)', 
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            transition: 'all 0.2s'
+          }}
+          onClick={handleExport}
+          title="Export canvas to JSON"
+        >
+          <span style={{ fontSize: '16px' }}>📤</span>
+          Export
+        </button>
+        <button
+          style={{ 
+            background: '#10b981', 
+            color: '#fff', 
+            border: 'none', 
+            borderRadius: 8, 
+            padding: '10px 18px', 
+            fontWeight: 600, 
+            fontSize: 14, 
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)', 
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            transition: 'all 0.2s'
+          }}
+          onClick={handleImportClick}
+          title="Import canvas from JSON"
+        >
+          <span style={{ fontSize: '16px' }}>📥</span>
+          Import
+        </button>
+        
+        {/* WebSocket Test Button */}
+        <button
+          style={{ 
+            background: wsConnected ? '#10b981' : '#f59e0b', 
+            color: '#fff', 
+            border: 'none', 
+            borderRadius: 8, 
+            padding: '10px 18px', 
+            fontWeight: 600, 
+            fontSize: 14, 
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)', 
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            transition: 'all 0.2s'
+          }}
+          onClick={() => {
+            websocketService.testConnection();
+            // Add a test message to the conversation
+            setAgentMessages(prev => [...prev, {
+              id: `test-${Date.now()}`,
+              agentId: 'system',
+              agentType: 'system',
+              agentName: 'System',
+              content: `🧪 Testing WebSocket connection... Status: ${wsStatus}`,
+              timestamp: new Date().toISOString(),
+              fromAgent: 'System',
+              toAgent: 'Test'
+            }]);
+            setShowConversation(true);
+          }}
+          title={`WebSocket Status: ${wsStatus}`}
+        >
+          <span style={{ fontSize: '16px' }}>🔗</span>
+          Test WS
+        </button>
+        
+        {/* Manual Message Test Button */}
+        <button
+          style={{ 
+            background: '#8b5cf6', 
+            color: '#fff', 
+            border: 'none', 
+            borderRadius: 8, 
+            padding: '10px 18px', 
+            fontWeight: 600, 
+            fontSize: 14, 
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)', 
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            transition: 'all 0.2s'
+          }}
+          onClick={() => {
+            // Manually add a message to test the display
+            const testMessage = {
+              id: `manual-${Date.now()}`,
+              agentId: 'test-agent',
+              agentType: 'test',
+              agentName: 'Test Agent',
+              content: `🧪 Manual test message at ${new Date().toLocaleTimeString()}`,
+              timestamp: new Date().toISOString(),
+              fromAgent: 'Test Agent',
+              toAgent: 'System'
+            };
+            console.log('🧪 Adding manual test message:', testMessage);
+            setAgentMessages(prev => [...prev, testMessage]);
+            setShowConversation(true);
+          }}
+          title="Add manual test message"
+        >
+          <span style={{ fontSize: '16px' }}>🧪</span>
+          Add Msg
         </button>
         
         {/* Online/Offline Mode Toggle */}
@@ -1113,6 +1853,57 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
             )}
           </button>
         </div>
+        
+        {/* WebSocket Test Controls */}
+        {isOnlineMode && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              background: isDark ? 'rgba(30,32,40,0.95)' : 'rgba(255,255,255,0.95)',
+              border: isDark ? '1.5px solid #444' : '1px solid #bbb',
+              borderRadius: 8,
+              padding: '6px 12px',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+            }}
+          >
+            <button
+              onClick={() => websocketService.testConnection()}
+              style={{
+                background: 'transparent',
+                color: isDark ? '#ccc' : '#666',
+                border: '1px solid',
+                borderColor: isDark ? '#444' : '#bbb',
+                borderRadius: 4,
+                padding: '4px 8px',
+                fontSize: 12,
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+              }}
+              title="Test WebSocket Connection"
+            >
+              🧪 Test WS
+            </button>
+            <button
+              onClick={() => websocketService.forceReconnect()}
+              style={{
+                background: 'transparent',
+                color: isDark ? '#ccc' : '#666',
+                border: '1px solid',
+                borderColor: isDark ? '#444' : '#bbb',
+                borderRadius: 4,
+                padding: '4px 8px',
+                fontSize: 12,
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+              }}
+              title="Force Reconnect WebSocket"
+            >
+              🔄 Reconnect
+            </button>
+          </div>
+        )}
         
         {/* Zoom and Pan Controls */}
         <div
@@ -1204,21 +1995,94 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
             flex: 1,
           }}
         >
+          {/* Online Service Status Indicator */}
+          {isOnlineMode && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '4px 8px',
+                borderRadius: '6px',
+                background: onlineServiceConnected 
+                  ? (isDark ? 'rgba(34,197,94,0.2)' : 'rgba(34,197,94,0.1)')
+                  : (isDark ? 'rgba(239,68,68,0.2)' : 'rgba(239,68,68,0.1)'),
+                border: onlineServiceConnected
+                  ? (isDark ? '1px solid #22c55e' : '1px solid #16a34a')
+                  : (isDark ? '1px solid #ef4444' : '1px solid #dc2626'),
+                fontSize: '12px',
+                color: onlineServiceConnected
+                  ? (isDark ? '#4ade80' : '#16a34a')
+                  : (isDark ? '#f87171' : '#dc2626'),
+              }}
+            >
+              <span>{onlineServiceConnected ? '🟢' : '🔴'}</span>
+              <span>{onlineServiceConnected ? 'Online' : 'Offline'}</span>
+            </div>
+          )}
+          
+          {/* WebSocket Status Indicator */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '4px 8px',
+              borderRadius: '6px',
+              background: wsConnected 
+                ? (isDark ? 'rgba(59,130,246,0.2)' : 'rgba(59,130,246,0.1)')
+                : (isDark ? 'rgba(245,158,11,0.2)' : 'rgba(245,158,11,0.1)'),
+              border: wsConnected
+                ? (isDark ? '1px solid #3b82f6' : '1px solid #2563eb')
+                : (isDark ? '1px solid #f59e0b' : '1px solid #d97706'),
+              fontSize: '12px',
+              color: wsConnected
+                ? (isDark ? '#60a5fa' : '#2563eb')
+                : (isDark ? '#fbbf24' : '#d97706'),
+            }}
+            title={`WebSocket: ${wsStatus}`}
+          >
+            <span>{wsConnected ? '🔗' : '⏳'}</span>
+            <span>{wsConnected ? 'Live' : 'Connecting...'}</span>
+          </div>
+          
+          {/* Models Loading Indicator */}
+          {isOnlineMode && modelsLoading && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '4px 8px',
+                borderRadius: '6px',
+                background: isDark ? 'rgba(59,130,246,0.2)' : 'rgba(59,130,246,0.1)',
+                border: isDark ? '1px solid #3b82f6' : '1px solid #2563eb',
+                fontSize: '12px',
+                color: isDark ? '#60a5fa' : '#2563eb',
+              }}
+            >
+              <span>⏳</span>
+              <span>Loading Models...</span>
+            </div>
+          )}
           <input
             type="text"
             value={prompt}
             onChange={e => setPrompt(e.target.value)}
-            placeholder="Enter your prompt or command..."
+            placeholder={isRunning ? "Workflow in progress..." : "Enter your prompt or command..."}
+            disabled={isRunning}
             style={{
               flex: 1,
               background: isDark ? '#181A20' : '#fff',
               color: isDark ? '#fff' : '#222',
               border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
-              borderRadius: 6,
-              padding: '8px 14px',
+              borderRadius: 8,
+              padding: '12px 16px',
               fontSize: 16,
               outline: 'none',
               minWidth: 0,
+              opacity: isRunning ? 0.7 : 1,
+              transition: 'all 0.2s'
             }}
           />
           <button
@@ -1243,6 +2107,132 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
       {/* Add top padding to canvas for agent boxes */}
       <div style={{ height: 70 }} />
       
+      {/* Live Conversation Display */}
+      {(showConversation || agentMessages.length > 0) && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 100,
+            right: 20,
+            width: 400,
+            maxHeight: 'calc(100vh - 200px)',
+            background: isDark ? 'rgba(30,32,40,0.95)' : 'rgba(255,255,255,0.95)',
+            border: isDark ? '1.5px solid #444' : '1.5px solid #bbb',
+            borderRadius: 10,
+            boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
+            padding: '16px',
+            overflow: 'hidden',
+            zIndex: 1000,
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '12px',
+              paddingBottom: '8px',
+              borderBottom: isDark ? '1px solid #444' : '1px solid #eee',
+            }}
+          >
+            <h3 style={{ 
+              margin: 0, 
+              color: isDark ? '#fff' : '#222',
+              fontSize: '16px',
+              fontWeight: '600',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}>
+              <span>🗨️</span>
+              <span>Live Conversation</span>
+              {isRunning && (
+                <span style={{
+                  fontSize: '12px',
+                  color: '#10b981',
+                  fontWeight: '500',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px'
+                }}>
+                  <span style={{
+                    width: '8px',
+                    height: '8px',
+                    borderRadius: '50%',
+                    background: '#10b981',
+                    animation: 'pulse 1.5s infinite'
+                  }}></span>
+                  Running...
+                </span>
+              )}
+            </h3>
+            <button
+              onClick={() => setAgentMessages([])}
+              style={{
+                background: 'transparent',
+                color: isDark ? '#ccc' : '#666',
+                border: 'none',
+                cursor: 'pointer',
+                fontSize: '14px',
+                padding: '4px 8px',
+                borderRadius: '4px',
+              }}
+              title="Clear messages"
+            >
+              ✕
+            </button>
+          </div>
+          <div
+            style={{
+              maxHeight: 'calc(100vh - 300px)',
+              overflowY: 'auto',
+              paddingRight: '8px',
+            }}
+          >
+            {agentMessages.map((message, index) => (
+              <div
+                key={message.id || index}
+                style={{
+                  marginBottom: '12px',
+                  padding: '12px',
+                  background: isDark ? 'rgba(50,52,60,0.8)' : 'rgba(248,250,252,0.8)',
+                  borderRadius: '8px',
+                  border: isDark ? '1px solid #444' : '1px solid #e2e8f0',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginBottom: '6px',
+                    fontSize: '12px',
+                    color: isDark ? '#888' : '#666',
+                  }}
+                >
+                  <span style={{ fontWeight: '600' }}>
+                    {message.fromAgent} → {message.toAgent}
+                  </span>
+                  <span>
+                    {new Date(message.timestamp).toLocaleTimeString()}
+                  </span>
+                </div>
+                <div
+                  style={{
+                    color: isDark ? '#fff' : '#222',
+                    fontSize: '14px',
+                    lineHeight: '1.4',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {message.content}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      
       {/* Canvas content with zoom and pan transformations */}
       <div
         style={{
@@ -1252,6 +2242,28 @@ const ManualAgentCanvas: React.FC<ManualAgentCanvasProps> = ({ isDark }) => {
           overflow: 'hidden',
         }}
       >
+        {/* Empty state when no agents */}
+        {boxes.length === 0 && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              textAlign: 'center',
+              color: isDark ? '#666' : '#999',
+              zIndex: 1,
+            }}
+          >
+            <div style={{ fontSize: '48px', marginBottom: '16px' }}>🤖</div>
+            <div style={{ fontSize: '18px', fontWeight: '500', marginBottom: '8px' }}>
+              No Agents Created
+            </div>
+            <div style={{ fontSize: '14px', opacity: 0.8 }}>
+              Click "Add Agent" to create your first agent and start building workflows
+            </div>
+          </div>
+        )}
         <div
           style={{
             transform: `scale(${canvasScale}) translate(${canvasOffset.x}px, ${canvasOffset.y}px)`,

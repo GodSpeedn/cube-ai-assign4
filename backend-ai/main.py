@@ -17,7 +17,7 @@ import json
 from enum import Enum
 import ast # Added for syntax validation
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -1174,6 +1174,17 @@ class MessageBus:
         if hasattr(self, 'logger'):
             asyncio.create_task(self.logger.log_message(message))
         
+        # NEW: Send real-time update via WebSocket
+        try:
+            await websocket_manager.send_agent_message(
+                from_agent=message.from_agent,
+                to_agent=message.to_agent,
+                content=message.content,
+                message_type=message.message_type.value
+            )
+        except Exception as e:
+            print(f"⚠️ WebSocket update failed: {e}")
+        
         target_agent = self.agents.get(message.to_agent)
         if not target_agent:
             print(f"⚠️ Warning: Agent {message.to_agent} not found")
@@ -1215,6 +1226,25 @@ class MessageBus:
             if not coordinator:
                 raise ValueError("No coordinator agent found")
             
+            # NEW: Send workflow start status via WebSocket
+            workflow_id = f"workflow_{datetime.now().timestamp()}"
+            try:
+                await websocket_manager.send_workflow_status(
+                    workflow_id=workflow_id,
+                    status="running",
+                    agents={agent_id: {"status": "idle"} for agent_id in self.agents.keys()}
+                )
+                
+                # Send a test message to verify WebSocket is working
+                await websocket_manager.send_agent_message(
+                    from_agent="system",
+                    to_agent="workflow",
+                    content="🚀 Workflow started - WebSocket connection verified!",
+                    message_type="system"
+                )
+            except Exception as e:
+                print(f"⚠️ WebSocket status update failed: {e}")
+            
             # Create initial task message from system to coordinator
             initial_message = AgentMessage(
                 id=f"workflow_start_{datetime.now().timestamp()}",
@@ -1231,7 +1261,20 @@ class MessageBus:
             
             # Wait a bit for the workflow to complete (in a real system, you'd have better completion detection)
             print(f"⏳ Waiting for workflow completion...")
-            await asyncio.sleep(5)  # Increased from 3 to 5 seconds
+            # Reduce wait time and add progress updates
+            for i in range(10):  # Wait 2 seconds total (10 * 0.2)
+                await asyncio.sleep(0.2)  # Check every 200ms
+                print(f"⏳ Workflow progress: {i+1}/10")
+                
+                # Send progress update via WebSocket
+                try:
+                    await websocket_manager.send_workflow_status(
+                        workflow_id=workflow_id,
+                        status="running",
+                        agents={agent_id: {"status": "working"} for agent_id in self.agents.keys()}
+                    )
+                except Exception as e:
+                    print(f"⚠️ WebSocket progress update failed: {e}")
             
             # Collect results from all agents
             results = {}
@@ -1244,6 +1287,17 @@ class MessageBus:
                 print(f"📊 Agent {agent_id}: {agent.status.value}, {len(agent.memory.short_term)} messages")
             
             print(f"✅ Workflow completed successfully")
+            
+            # NEW: Send workflow completion status via WebSocket
+            try:
+                await websocket_manager.send_workflow_status(
+                    workflow_id=workflow_id,
+                    status="completed",
+                    agents={agent_id: {"status": agent_data["status"]} for agent_id, agent_data in results.items()}
+                )
+            except Exception as e:
+                print(f"⚠️ WebSocket completion update failed: {e}")
+            
             return {
                 "success": True,
                 "results": results,
@@ -2022,6 +2076,131 @@ async def run_online_workflow_from_main(request: OnlineWorkflowRequest):
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Online workflow failed: {str(e)}")
+
+# =============================================================================
+# WEBSOCKET MANAGER FOR REAL-TIME COMMUNICATION
+# =============================================================================
+
+class WebSocketManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        self.workflow_status: Dict[str, Dict] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        print(f"🔗 WebSocket connected. Total connections: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        print(f"🔌 WebSocket disconnected. Total connections: {len(self.active_connections)}")
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        try:
+            await websocket.send_text(message)
+        except Exception as e:
+            print(f"Error sending message: {e}")
+            self.disconnect(websocket)
+
+    async def broadcast(self, message: str):
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                print(f"Error broadcasting message: {e}")
+                disconnected.append(connection)
+        
+        # Remove disconnected connections
+        for connection in disconnected:
+            self.disconnect(connection)
+
+    async def send_agent_message(self, from_agent: str, to_agent: str, content: str, message_type: str = "message"):
+        """Send agent message to all connected clients"""
+        message = {
+            "type": "agent_message",
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+            "content": content,
+            "message_type": message_type,
+            "timestamp": datetime.now().isoformat()
+        }
+        await self.broadcast(json.dumps(message))
+
+    async def send_workflow_status(self, workflow_id: str, status: str, agents: Dict = None, message_history: List = None):
+        """Send workflow status update to all connected clients"""
+        message = {
+            "type": "workflow_status",
+            "workflow_id": workflow_id,
+            "status": status,
+            "agents": agents or {},
+            "message_history": message_history or [],
+            "timestamp": datetime.now().isoformat()
+        }
+        await self.broadcast(json.dumps(message))
+
+# Create WebSocket manager instance
+websocket_manager = WebSocketManager()
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time communication"""
+    await websocket_manager.connect(websocket)
+    try:
+        while True:
+            # Wait for messages from client
+            data = await websocket.receive_text()
+            try:
+                message = json.loads(data)
+                print(f"📨 Received WebSocket message: {message}")
+                
+                # Handle different message types
+                if message.get("type") == "test":
+                    # Send test response
+                    await websocket_manager.send_personal_message(
+                        json.dumps({
+                            "type": "test_response",
+                            "message": "WebSocket connection working!",
+                            "timestamp": datetime.now().isoformat()
+                        }),
+                        websocket
+                    )
+                elif message.get("type") == "ping":
+                    # Send pong response
+                    await websocket_manager.send_personal_message(
+                        json.dumps({
+                            "type": "pong",
+                            "timestamp": datetime.now().isoformat()
+                        }),
+                        websocket
+                    )
+                else:
+                    # Echo back unknown messages
+                    await websocket_manager.send_personal_message(
+                        json.dumps({
+                            "type": "echo",
+                            "original_message": message,
+                            "timestamp": datetime.now().isoformat()
+                        }),
+                        websocket
+                    )
+                    
+            except json.JSONDecodeError:
+                await websocket_manager.send_personal_message(
+                    json.dumps({
+                        "type": "error",
+                        "message": "Invalid JSON format",
+                        "timestamp": datetime.now().isoformat()
+                    }),
+                    websocket
+                )
+                
+    except WebSocketDisconnect:
+        websocket_manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        websocket_manager.disconnect(websocket)
 
 # =============================================================================
 # STARTUP MESSAGE - SHOWS WHEN SERVER STARTS
