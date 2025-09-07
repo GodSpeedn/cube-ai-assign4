@@ -1,0 +1,6 @@
+def subtract_numbers(a: int, b: int) -> int:
+    """Subtract two numbers and return the result."""
+    try:
+        return a - b
+    except TypeError as e:
+        raise ValueError(f"Both arguments must be integers: {e}")
